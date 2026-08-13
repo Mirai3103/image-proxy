@@ -1,4 +1,7 @@
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -103,3 +106,32 @@ def test_load_config_rejects_non_utf8_file(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="could not read"):
         load_config(path)
+
+
+def test_load_config_reads_utf8_config_under_c_locale(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID.replace("UPSCALED", "CAFÉ"), encoding="utf-8")
+    environment = os.environ | {
+        "LC_ALL": "C",
+        "PYTHONCOERCECLOCALE": "0",
+        "PYTHONUTF8": "0",
+    }
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "from image_proxy.config import load_config; "
+                "load_config(Path(__import__('sys').argv[1]))"
+            ),
+            str(path),
+        ],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

@@ -106,7 +106,7 @@ def _section(
 def load_config(path: Path) -> AppConfig:
     """Load, validate, and convert the YAML configuration at *path*."""
     try:
-        raw = yaml.safe_load(path.read_text())
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ConfigError(f"configuration file not found: {path}") from exc
     except OSError as exc:
