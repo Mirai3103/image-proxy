@@ -1,10 +1,12 @@
-import logging
 import gzip
+import logging
+import threading
 from io import BytesIO
 from pathlib import Path
 
 import pytest
 from mitmproxy import http
+from mitmproxy.net import encoding
 from mitmproxy.test import tflow
 from PIL import Image
 
@@ -138,6 +140,29 @@ async def test_matching_request_records_cache_miss_without_logging_secrets(
 
 
 @pytest.mark.asyncio
+async def test_non_utf8_private_header_fails_open_without_leaking_secrets(
+    addon, caplog
+) -> None:
+    flow = tflow.tflow(resp=False)
+    flow.request.url = "https://img.cdn.test/manga/page.jpg?token=query-secret"
+    flow.request.headers.fields += (
+        (b"Authorization", b"Bearer \xffheader-secret"),
+        (b"Cookie", b"session=cookie-secret"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await addon.request(flow)
+
+    assert "image_proxy.cache_key" not in flow.metadata
+    assert "FALLBACK" in caplog.text
+    assert "UnicodeEncodeError" in caplog.text
+    assert "img.cdn.test" in caplog.text
+    assert "/manga/page.jpg" in caplog.text
+    for secret in ("query-secret", "header-secret", "cookie-secret"):
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_matching_jpeg_is_processed_and_representation_headers_repaired(
     addon, jpeg_bytes: bytes
 ) -> None:
@@ -190,6 +215,57 @@ async def test_content_encoded_jpeg_is_processed_from_decoded_body(
     assert "Content-Encoding" not in flow.response.headers
     with Image.open(BytesIO(flow.response.raw_content)) as image:
         assert image.format == "JPEG"
+
+
+@pytest.mark.asyncio
+async def test_content_decoding_and_processing_run_off_event_loop_thread(
+    addon, jpeg_bytes: bytes, monkeypatch
+) -> None:
+    flow = matching_flow(jpeg_bytes)
+    flow.response.headers["Content-Encoding"] = "gzip"
+    flow.response.raw_content = gzip.compress(jpeg_bytes, mtime=1)
+    event_loop_thread = threading.get_ident()
+    decode_threads: list[int] = []
+    real_decode = encoding.decode
+
+    def recording_real_decode(
+        encoded: None | str | bytes, content_encoding: str, errors: str = "strict"
+    ) -> None | str | bytes:
+        decode_threads.append(threading.get_ident())
+        return real_decode(encoded, content_encoding, errors)
+
+    monkeypatch.setattr(encoding, "decode", recording_real_decode)
+
+    await addon.request(flow)
+    await addon.response(flow)
+
+    assert decode_threads
+    assert all(thread_id != event_loop_thread for thread_id in decode_threads)
+    assert "Content-Encoding" not in flow.response.headers
+    with Image.open(BytesIO(flow.response.raw_content)) as image:
+        assert image.format == "JPEG"
+
+
+@pytest.mark.asyncio
+async def test_content_decode_failure_restores_raw_body_and_headers(
+    addon, caplog
+) -> None:
+    flow = matching_flow(b"not-gzip-data")
+    flow.request.url = "https://img.cdn.test/manga/page.jpg?token=query-secret"
+    flow.response.headers["Content-Encoding"] = "gzip"
+    flow.response.raw_content = b"not-gzip-data"
+    original_body = flow.response.raw_content
+    original_headers = tuple(flow.response.headers.fields)
+
+    with caplog.at_level(logging.WARNING):
+        await addon.request(flow)
+        await addon.response(flow)
+
+    assert flow.response.raw_content == original_body
+    assert tuple(flow.response.headers.fields) == original_headers
+    assert "FALLBACK" in caplog.text
+    assert "ValueError" in caplog.text
+    assert "query-secret" not in caplog.text
 
 
 @pytest.mark.asyncio
