@@ -1,7 +1,9 @@
 import sqlite3
 from pathlib import Path
 
-from image_proxy.cache import CacheStore
+import pytest
+
+from image_proxy.cache import CacheError, CacheStore
 from image_proxy.config import CacheConfig
 
 
@@ -57,6 +59,59 @@ def test_missing_artifact_removes_broken_metadata(tmp_path: Path) -> None:
 
     assert cache.get(key) is None
 
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
+        count = database.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    assert count == 0
+
+
+def test_failed_metadata_write_after_replacement_never_serves_stale_metadata(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock)
+    key = "c" * 64
+    cache.put(
+        key,
+        "https://cdn.test/old.jpg",
+        "old-fingerprint",
+        "image/jpeg",
+        {"Cache-Control": "max-age=60"},
+        b"old-bytes",
+    )
+
+    connection = cache._connection
+    assert connection is not None
+    deny_metadata_writes = True
+
+    def deny_entry_insert(
+        action: int,
+        first_argument: str | None,
+        second_argument: str | None,
+        database_name: str | None,
+        trigger_name: str | None,
+    ) -> int:
+        if (
+            deny_metadata_writes
+            and action == sqlite3.SQLITE_INSERT
+            and first_argument == "entries"
+        ):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(deny_entry_insert)
+    with pytest.raises(CacheError, match="could not write cache artifact"):
+        cache.put(
+            key,
+            "https://cdn.test/new.webp",
+            "new-fingerprint",
+            "image/webp",
+            {"Content-Disposition": "inline"},
+            b"new-bytes",
+        )
+    deny_metadata_writes = False
+
+    assert cache.get(key) is None
+    assert not list((tmp_path / "artifacts").rglob("*.img"))
     with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
         count = database.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
     assert count == 0

@@ -154,6 +154,7 @@ class CacheStore:
         with self._lock:
             connection = self._require_connection()
             temporary_path: Path | None = None
+            artifact_replaced = False
             try:
                 artifact.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(
@@ -165,6 +166,7 @@ class CacheStore:
                     os.fsync(temporary.fileno())
                 os.replace(temporary_path, artifact)
                 temporary_path = None
+                artifact_replaced = True
 
                 created_at = self._now()
                 expires_at = created_at + self._config.ttl_seconds
@@ -204,6 +206,11 @@ class CacheStore:
                 if temporary_path is not None:
                     try:
                         temporary_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if artifact_replaced:
+                    try:
+                        artifact.unlink(missing_ok=True)
                     except OSError:
                         pass
                 raise CacheError("could not write cache artifact") from exc
