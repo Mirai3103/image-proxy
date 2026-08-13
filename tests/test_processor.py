@@ -1,7 +1,7 @@
 from io import BytesIO
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from image_proxy.config import ProcessingConfig
 from image_proxy.processor import ProcessingError, WatermarkProcessor
@@ -67,6 +67,20 @@ def test_process_rejects_animated_webp() -> None:
         processor().process(output.getvalue(), "image/webp")
 
 
+def test_fitting_font_keeps_stroked_long_watermark_within_narrow_image() -> None:
+    instance = processor()
+    image_width = 120
+    draw = ImageDraw.Draw(Image.new("RGB", (image_width, 80), "white"))
+
+    font = instance._fitting_font(draw, image_width)
+    stroke_width = max(1, font.size // 16)
+    left, _, right, _ = draw.textbbox(
+        (0, 0), "UPSCALED", font=font, stroke_width=stroke_width
+    )
+
+    assert right - left <= image_width * 0.9
+
+
 def test_fingerprint_changes_when_output_configuration_changes() -> None:
     base = processor().fingerprint
     changed = WatermarkProcessor(
@@ -74,3 +88,17 @@ def test_fingerprint_changes_when_output_configuration_changes() -> None:
     ).fingerprint
 
     assert changed != base
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        ProcessingConfig("UPSCALED", 90, 90, 2 * 1024**2, 1_000_000, 2),
+        ProcessingConfig("UPSCALED", 90, 90, 1024**2, 2_000_000, 2),
+        ProcessingConfig("UPSCALED", 90, 90, 1024**2, 1_000_000, 8),
+    ],
+)
+def test_fingerprint_ignores_safety_and_worker_configuration(
+    config: ProcessingConfig,
+) -> None:
+    assert WatermarkProcessor(config).fingerprint == processor().fingerprint

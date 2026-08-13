@@ -153,7 +153,10 @@ class WatermarkProcessor:
         size = min(160, max(18, image_width // 10))
         while True:
             font = self._font(size)
-            left, _, right, _ = draw.textbbox((0, 0), self._config.text, font=font)
+            stroke_width = max(1, font.size // 16)
+            left, _, right, _ = draw.textbbox(
+                (0, 0), self._config.text, font=font, stroke_width=stroke_width
+            )
             if right - left <= image_width * 0.9 or size == 1:
                 return font
             size -= 1
