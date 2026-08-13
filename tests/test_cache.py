@@ -164,3 +164,113 @@ def test_cleanup_removes_expired_rows_and_orphan_files(tmp_path: Path) -> None:
     assert report.orphan_count == 1
     assert cache.total_size_bytes() == 0
     assert not orphan.exists()
+
+
+def test_cleanup_preserves_expired_artifact_when_metadata_delete_fails(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock, ttl=10)
+    key = "a" * 64
+    cache.put(key, "https://cdn/a", "fp", "image/jpeg", {}, b"old")
+    artifact = tmp_path / "artifacts" / "aa" / (key + ".img")
+    clock.now += 11
+
+    connection = cache._connection
+    assert connection is not None
+
+    def deny_entry_delete(
+        action: int,
+        first_argument: str | None,
+        second_argument: str | None,
+        database_name: str | None,
+        trigger_name: str | None,
+    ) -> int:
+        if action == sqlite3.SQLITE_DELETE and first_argument == "entries":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(deny_entry_delete)
+    with pytest.raises(CacheError, match="could not clean up cache storage"):
+        cache.cleanup()
+    connection.set_authorizer(None)
+
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
+        count = database.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    assert count == 1
+    assert artifact.read_bytes() == b"old"
+
+
+def test_cleanup_commits_lru_batch_before_failed_artifact_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    writer = CacheStore(CacheConfig(tmp_path, 600, 100, 0.6, 600, 2), clock=clock)
+    writer.initialize()
+    for index, key_char in enumerate(("a", "b", "c")):
+        clock.now += 1
+        writer.put(key_char * 64, f"https://cdn/{key_char}", "fp", "image/jpeg", {}, b"xxxx")
+    writer.close()
+
+    cache = CacheStore(CacheConfig(tmp_path, 600, 10, 0.6, 600, 2), clock=clock)
+    cache.initialize()
+    failed_artifact = tmp_path / "artifacts" / "bb" / ("b" * 64 + ".img")
+    original_unlink = Path.unlink
+
+    def fail_selected_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == failed_artifact:
+            raise OSError("simulated artifact deletion failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_selected_unlink)
+    with pytest.raises(CacheError, match="could not clean up cache storage"):
+        cache.cleanup()
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
+        remaining_keys = {
+            row[0] for row in database.execute("SELECT cache_key FROM entries")
+        }
+    assert remaining_keys == {"c" * 64}
+    assert failed_artifact.read_bytes() == b"xxxx"
+    assert not (tmp_path / "artifacts" / "aa" / ("a" * 64 + ".img")).exists()
+
+    report = cache.cleanup()
+    assert report.expired_count == 0
+    assert report.lru_count == 0
+    assert report.orphan_count == 1
+    assert report.bytes_freed == 4
+
+
+def test_put_translates_post_commit_size_query_failures_without_removing_entry(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock)
+    key = "d" * 64
+    connection = cache._connection
+    assert connection is not None
+
+    def deny_sum(
+        action: int,
+        first_argument: str | None,
+        second_argument: str | None,
+        database_name: str | None,
+        trigger_name: str | None,
+    ) -> int:
+        if action == sqlite3.SQLITE_FUNCTION and second_argument == "sum":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(deny_sum)
+    with pytest.raises(CacheError, match="could not calculate cache size"):
+        cache.put(key, "https://cdn/d", "fp", "image/jpeg", {}, b"saved")
+    connection.set_authorizer(None)
+
+    artifact = tmp_path / "artifacts" / "dd" / (key + ".img")
+    assert artifact.read_bytes() == b"saved"
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
+        row = database.execute(
+            "SELECT cache_key, size_bytes FROM entries WHERE cache_key = ?", (key,)
+        ).fetchone()
+    assert row == (key, 5)

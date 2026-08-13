@@ -223,7 +223,13 @@ class CacheStore:
                         pass
                 raise CacheError("could not write cache artifact") from exc
 
-            if self._total_size_bytes(connection) > self._config.max_size_bytes:
+            try:
+                exceeds_maximum = (
+                    self._total_size_bytes(connection) > self._config.max_size_bytes
+                )
+            except sqlite3.Error as exc:
+                raise CacheError("could not calculate cache size") from exc
+            if exceeds_maximum:
                 self._cleanup_locked(connection)
 
     def cleanup(self) -> CleanupReport:
@@ -271,9 +277,9 @@ class CacheStore:
         return self._config.directory / artifact_path
 
     def _remove_entry(self, connection: sqlite3.Connection, row: sqlite3.Row) -> None:
-        self._artifact_absolute_path(row["artifact_path"]).unlink(missing_ok=True)
         with connection:
             connection.execute("DELETE FROM entries WHERE cache_key = ?", (row["cache_key"],))
+        self._artifact_absolute_path(row["artifact_path"]).unlink(missing_ok=True)
 
     def _cleanup_locked(self, connection: sqlite3.Connection) -> CleanupReport:
         expired_count = 0
@@ -323,14 +329,14 @@ class CacheStore:
                     if not lru_rows:
                         break
 
-                    for row in lru_rows:
-                        self._artifact_absolute_path(row["artifact_path"]).unlink(
-                            missing_ok=True
-                        )
                     with connection:
                         connection.executemany(
                             "DELETE FROM entries WHERE cache_key = ?",
                             ((row["cache_key"],) for row in lru_rows),
+                        )
+                    for row in lru_rows:
+                        self._artifact_absolute_path(row["artifact_path"]).unlink(
+                            missing_ok=True
                         )
 
                     batch_size = sum(row["size_bytes"] for row in lru_rows)
