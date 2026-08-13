@@ -54,6 +54,14 @@ class CacheHit:
     headers: dict[str, str]
 
 
+@dataclass(frozen=True)
+class CleanupReport:
+    expired_count: int
+    lru_count: int
+    orphan_count: int
+    bytes_freed: int
+
+
 class CacheStore:
     """Stores cache metadata in SQLite and payloads as atomic disk artifacts."""
 
@@ -215,6 +223,29 @@ class CacheStore:
                         pass
                 raise CacheError("could not write cache artifact") from exc
 
+            if self._total_size_bytes(connection) > self._config.max_size_bytes:
+                self._cleanup_locked(connection)
+
+    def cleanup(self) -> CleanupReport:
+        """Remove expired, orphaned, and least-recently-used cache entries."""
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                return self._cleanup_locked(connection)
+            except CacheError:
+                raise
+            except (OSError, sqlite3.Error) as exc:
+                raise CacheError("could not clean up cache storage") from exc
+
+    def total_size_bytes(self) -> int:
+        """Return the total size recorded by cache metadata."""
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                return self._total_size_bytes(connection)
+            except sqlite3.Error as exc:
+                raise CacheError("could not calculate cache size") from exc
+
     def close(self) -> None:
         """Close the SQLite connection."""
         with self._lock:
@@ -243,6 +274,80 @@ class CacheStore:
         self._artifact_absolute_path(row["artifact_path"]).unlink(missing_ok=True)
         with connection:
             connection.execute("DELETE FROM entries WHERE cache_key = ?", (row["cache_key"],))
+
+    def _cleanup_locked(self, connection: sqlite3.Connection) -> CleanupReport:
+        expired_count = 0
+        lru_count = 0
+        orphan_count = 0
+        bytes_freed = 0
+
+        try:
+            expired_rows = connection.execute(
+                "SELECT * FROM entries WHERE expires_at <= ?", (self._now(),)
+            ).fetchall()
+            for row in expired_rows:
+                self._remove_entry(connection, row)
+                expired_count += 1
+                bytes_freed += row["size_bytes"]
+
+            tracked_artifacts = {
+                row["artifact_path"]
+                for row in connection.execute("SELECT artifact_path FROM entries")
+            }
+            for artifact in self._artifacts_directory.rglob("*.img"):
+                relative_path = str(artifact.relative_to(self._config.directory))
+                if relative_path in tracked_artifacts:
+                    continue
+                try:
+                    size_bytes = artifact.stat().st_size
+                    artifact.unlink()
+                except FileNotFoundError:
+                    continue
+                orphan_count += 1
+                bytes_freed += size_bytes
+
+            total_size = self._total_size_bytes(connection)
+            if total_size > self._config.max_size_bytes:
+                low_watermark = int(
+                    self._config.max_size_bytes * self._config.low_watermark_ratio
+                )
+                while total_size > low_watermark:
+                    lru_rows = connection.execute(
+                        """
+                        SELECT * FROM entries
+                        ORDER BY last_accessed_at ASC, cache_key ASC
+                        LIMIT ?
+                        """,
+                        (self._config.eviction_batch_size,),
+                    ).fetchall()
+                    if not lru_rows:
+                        break
+
+                    for row in lru_rows:
+                        self._artifact_absolute_path(row["artifact_path"]).unlink(
+                            missing_ok=True
+                        )
+                    with connection:
+                        connection.executemany(
+                            "DELETE FROM entries WHERE cache_key = ?",
+                            ((row["cache_key"],) for row in lru_rows),
+                        )
+
+                    batch_size = sum(row["size_bytes"] for row in lru_rows)
+                    total_size -= batch_size
+                    lru_count += len(lru_rows)
+                    bytes_freed += batch_size
+        except (OSError, sqlite3.Error) as exc:
+            raise CacheError("could not clean up cache storage") from exc
+
+        return CleanupReport(expired_count, lru_count, orphan_count, bytes_freed)
+
+    @staticmethod
+    def _total_size_bytes(connection: sqlite3.Connection) -> int:
+        total_size = connection.execute(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM entries"
+        ).fetchone()[0]
+        return int(total_size)
 
     def _require_connection(self) -> sqlite3.Connection:
         if self._connection is None:

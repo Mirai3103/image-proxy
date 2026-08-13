@@ -115,3 +115,52 @@ def test_failed_metadata_write_after_replacement_never_serves_stale_metadata(
     with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
         count = database.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
     assert count == 0
+
+
+def test_cleanup_evicts_oldest_in_batches_to_low_watermark(tmp_path: Path) -> None:
+    clock = Clock()
+    writer = CacheStore(CacheConfig(tmp_path, 600, 100, 0.6, 600, 1), clock=clock)
+    writer.initialize()
+    for index, key_char in enumerate(("a", "b", "c", "d")):
+        clock.now = 1_000 + index
+        writer.put(key_char * 64, f"https://cdn/{key_char}", "fp", "image/jpeg", {}, b"xxxx")
+    writer.close()
+
+    cache = CacheStore(CacheConfig(tmp_path, 600, 10, 0.6, 600, 1), clock=clock)
+    cache.initialize()
+
+    report = cache.cleanup()
+
+    assert report.lru_count == 3
+    assert cache.total_size_bytes() == 4
+    assert cache.get("d" * 64) is not None
+    assert cache.get("a" * 64) is None
+
+
+def test_put_triggers_cleanup_after_crossing_maximum(tmp_path: Path) -> None:
+    clock = Clock()
+    cache = CacheStore(CacheConfig(tmp_path, 600, 10, 0.6, 600, 1), clock=clock)
+    cache.initialize()
+    for key_char in ("a", "b", "c"):
+        clock.now += 1
+        cache.put(key_char * 64, f"https://cdn/{key_char}", "fp", "image/jpeg", {}, b"xxxx")
+    assert cache.total_size_bytes() == 4
+    assert cache.get("c" * 64) is not None
+    assert cache.get("a" * 64) is None
+
+
+def test_cleanup_removes_expired_rows_and_orphan_files(tmp_path: Path) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock, ttl=10)
+    cache.put("a" * 64, "https://cdn/a", "fp", "image/jpeg", {}, b"old")
+    orphan = tmp_path / "artifacts" / "ff" / ("f" * 64 + ".img")
+    orphan.parent.mkdir(parents=True)
+    orphan.write_bytes(b"orphan")
+    clock.now += 11
+
+    report = cache.cleanup()
+
+    assert report.expired_count == 1
+    assert report.orphan_count == 1
+    assert cache.total_size_bytes() == 0
+    assert not orphan.exists()
