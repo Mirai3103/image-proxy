@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 from urllib.parse import urlsplit
 
@@ -48,14 +49,25 @@ def _decode_and_process(
     content_encoding: str | None,
     content_type: str | None,
 ) -> ProcessedImage:
-    decoded_content = (
-        encoding.decode(raw_content, content_encoding)
-        if content_encoding
-        else raw_content
-    )
+    decoded_content = _decode_content(raw_content, content_encoding)
     if not isinstance(decoded_content, bytes):
         raise ValueError("decoded response content is not bytes")
     return processor.process(decoded_content, content_type)
+
+
+def _decode_content(raw_content: bytes, content_encoding: str | None) -> str | bytes:
+    if not content_encoding:
+        return raw_content
+    normalized = content_encoding.lower()
+    try:
+        decoder = encoding.custom_decode.get(normalized)
+        if decoder is not None:
+            return decoder(raw_content)
+        return codecs.decode(raw_content, normalized, "strict")
+    except TypeError:
+        raise
+    except Exception as exc:
+        raise ValueError("could not decode response content") from exc
 
 
 class ImageProxyAddon:

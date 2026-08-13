@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import logging
 import threading
@@ -226,15 +227,13 @@ async def test_content_decoding_and_processing_run_off_event_loop_thread(
     flow.response.raw_content = gzip.compress(jpeg_bytes, mtime=1)
     event_loop_thread = threading.get_ident()
     decode_threads: list[int] = []
-    real_decode = encoding.decode
+    real_decode_gzip = encoding.custom_decode["gzip"]
 
-    def recording_real_decode(
-        encoded: None | str | bytes, content_encoding: str, errors: str = "strict"
-    ) -> None | str | bytes:
+    def recording_real_decode(encoded: bytes) -> bytes:
         decode_threads.append(threading.get_ident())
-        return real_decode(encoded, content_encoding, errors)
+        return real_decode_gzip(encoded)
 
-    monkeypatch.setattr(encoding, "decode", recording_real_decode)
+    monkeypatch.setitem(encoding.custom_decode, "gzip", recording_real_decode)
 
     await addon.request(flow)
     await addon.response(flow)
@@ -244,6 +243,82 @@ async def test_content_decoding_and_processing_run_off_event_loop_thread(
     assert "Content-Encoding" not in flow.response.headers
     with Image.open(BytesIO(flow.response.raw_content)) as image:
         assert image.format == "JPEG"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_gzip_flows_keep_decoded_bodies_with_their_cache_keys(
+    addon, monkeypatch
+) -> None:
+    first_source = BytesIO()
+    Image.new("RGB", (240, 320), "white").save(first_source, "JPEG")
+    second_source = BytesIO()
+    Image.new("RGB", (240, 320), "black").save(second_source, "JPEG")
+    first_encoded = gzip.compress(first_source.getvalue(), mtime=1)
+    second_encoded = gzip.compress(second_source.getvalue(), mtime=2)
+    first_cache_check_started = threading.Event()
+    second_cache_committed = threading.Event()
+
+    class CoordinatedCachedBytes(bytes):
+        def __eq__(self, other) -> bool:
+            equal = bytes.__eq__(self, other)
+            if equal:
+                first_cache_check_started.set()
+                if not second_cache_committed.wait(timeout=2):
+                    raise AssertionError("second decode did not replace the shared cache")
+            return equal
+
+        __hash__ = bytes.__hash__
+
+    monkeypatch.setattr(
+        encoding,
+        "_cache",
+        encoding.CachedDecode(
+            CoordinatedCachedBytes(first_encoded),
+            "gzip",
+            "strict",
+            first_source.getvalue(),
+        ),
+    )
+    real_decode = encoding.decode
+
+    def coordinated_real_decode(
+        encoded: None | str | bytes, content_encoding: str, errors: str = "strict"
+    ) -> None | str | bytes:
+        is_second = isinstance(encoded, bytes) and encoded == second_encoded
+        if is_second and not first_cache_check_started.wait(timeout=2):
+            raise AssertionError("first decode did not begin its cache check")
+        decoded = real_decode(encoded, content_encoding, errors)
+        if is_second:
+            second_cache_committed.set()
+        return decoded
+
+    monkeypatch.setattr(encoding, "decode", coordinated_real_decode)
+
+    first = matching_flow(first_encoded)
+    first.request.url = "https://img.cdn.test/manga/first.jpg"
+    first.response.headers["Content-Encoding"] = "gzip"
+    first.response.raw_content = first_encoded
+    second = matching_flow(second_encoded)
+    second.request.url = "https://img.cdn.test/manga/second.jpg"
+    second.response.headers["Content-Encoding"] = "gzip"
+    second.response.raw_content = second_encoded
+    await addon.request(first)
+    await addon.request(second)
+    first_key = first.metadata["image_proxy.cache_key"]
+    second_key = second.metadata["image_proxy.cache_key"]
+
+    await asyncio.gather(addon.response(first), addon.response(second))
+
+    first_cached = addon.cache.get(first_key)
+    second_cached = addon.cache.get(second_key)
+    assert first_cached is not None
+    assert second_cached is not None
+    with Image.open(BytesIO(first_cached.data)) as image:
+        assert min(image.getpixel((0, 0))) > 240
+    with Image.open(BytesIO(second_cached.data)) as image:
+        assert max(image.getpixel((0, 0))) < 15
+    assert first.response.raw_content == first_cached.data
+    assert second.response.raw_content == second_cached.data
 
 
 @pytest.mark.asyncio
