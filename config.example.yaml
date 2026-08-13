@@ -1,0 +1,29 @@
+# Listening on all interfaces with no authentication is appropriate only on a
+# trusted LAN. Do not expose this proxy to the public internet.
+proxy:
+  host: 0.0.0.0
+  port: 8080
+
+matching:
+  # A hostname glob or a full-URL regular expression is sufficient to match.
+  domains:
+    - "*.example-cdn.com"
+  url_regex:
+    - "/manga/"
+    - "\\.(jpe?g|webp)(\\?|$)"
+
+processing:
+  text: "UPSCALED"
+  jpeg_quality: 90
+  webp_quality: 90
+  max_source_mb: 30
+  max_pixels: 80000000
+  workers: 2
+
+cache:
+  directory: "./data/cache"
+  ttl_hours: 168
+  max_size_gb: 10
+  low_watermark_ratio: 0.90
+  cleanup_interval_minutes: 10
+  eviction_batch_size: 25
