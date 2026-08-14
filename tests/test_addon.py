@@ -4,8 +4,10 @@ import logging
 import threading
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from mitmproxy.exceptions import OptionsError
 from mitmproxy import http
 from mitmproxy.net import encoding
 from mitmproxy.test import tflow
@@ -82,6 +84,16 @@ def matching_flow(image_bytes: bytes, content_type: str = "image/jpeg"):
         {"Content-Type": content_type, "Access-Control-Allow-Origin": "*"},
     )
     return flow
+
+
+class RecordingLoader:
+    def __init__(self) -> None:
+        self.options: list[tuple[str, type, object]] = []
+
+    def add_option(
+        self, name: str, typespec: type, default: object, help: str
+    ) -> None:
+        self.options.append((name, typespec, default))
 
 
 @pytest.mark.asyncio
@@ -796,3 +808,84 @@ async def test_shutdown_retries_cache_close_after_transient_failure(
     assert lifecycle_addon.maintenance_task is None
     with pytest.raises(CacheError, match="not initialized"):
         lifecycle_addon.cache.total_size_bytes()
+
+
+def test_load_registers_image_proxy_config_option() -> None:
+    instance = ImageProxyAddon()
+    loader = RecordingLoader()
+
+    instance.load(loader)
+
+    assert loader.options == [("image_proxy_config", str, "")]
+
+
+def test_configure_rejects_missing_image_proxy_config(monkeypatch) -> None:
+    instance = ImageProxyAddon()
+    monkeypatch.setattr(
+        "image_proxy.addon.ctx",
+        SimpleNamespace(options=SimpleNamespace(image_proxy_config="")),
+    )
+
+    with pytest.raises(OptionsError, match="image_proxy_config"):
+        instance.configure({"image_proxy_config"})
+
+
+@pytest.mark.asyncio
+async def test_configure_loads_config_and_initializes_dependencies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(Path("config.example.yaml").read_text())
+    instance = ImageProxyAddon()
+    monkeypatch.setattr(
+        "image_proxy.addon.ctx",
+        SimpleNamespace(options=SimpleNamespace(image_proxy_config=str(config_path))),
+    )
+
+    instance.configure({"image_proxy_config"})
+
+    assert instance.config is not None
+    assert instance.config.proxy.port == 8080
+    assert instance.matcher is not None
+    assert instance.processor is not None
+    assert instance.cache is not None
+    assert instance.cache.total_size_bytes() == 0
+    await instance.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_running_starts_and_done_stops_configured_addon(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(Path("config.example.yaml").read_text())
+    instance = ImageProxyAddon()
+    monkeypatch.setattr(
+        "image_proxy.addon.ctx",
+        SimpleNamespace(options=SimpleNamespace(image_proxy_config=str(config_path))),
+    )
+    instance.configure({"image_proxy_config"})
+
+    await instance.running()
+    maintenance_task = instance.maintenance_task
+    await instance.done()
+
+    assert maintenance_task is not None
+    assert maintenance_task.cancelled()
+    assert instance.maintenance_task is None
+    assert instance.cache is not None
+    with pytest.raises(CacheError, match="not initialized"):
+        instance.cache.total_size_bytes()
+
+
+@pytest.mark.asyncio
+async def test_done_propagates_unexpected_shutdown_errors(monkeypatch) -> None:
+    instance = ImageProxyAddon()
+
+    async def fail_shutdown() -> None:
+        raise RuntimeError("shutdown exploded")
+
+    monkeypatch.setattr(instance, "shutdown", fail_shutdown)
+
+    with pytest.raises(RuntimeError, match="shutdown exploded"):
+        await instance.done()

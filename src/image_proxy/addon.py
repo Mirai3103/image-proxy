@@ -8,14 +8,16 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import logging
+from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlsplit
 
-from mitmproxy import http
+from mitmproxy import ctx, http
+from mitmproxy.exceptions import OptionsError
 from mitmproxy.net import encoding
 
 from image_proxy.cache import CacheError, CacheHit, CacheStore, CleanupReport
-from image_proxy.config import AppConfig
+from image_proxy.config import AppConfig, ConfigError, load_config
 from image_proxy.matcher import UrlMatcher, build_cache_key, is_eligible_request
 from image_proxy.processor import ImageProcessor, ProcessedImage, WatermarkProcessor
 
@@ -111,6 +113,39 @@ class ImageProxyAddon:
         """Return the active periodic-maintenance task, if any."""
         return self._maintenance_task
 
+    def load(self, loader) -> None:
+        """Register the configuration-file path option with mitmproxy."""
+        loader.add_option(
+            "image_proxy_config",
+            str,
+            "",
+            "Path to the image proxy YAML configuration file.",
+        )
+
+    def configure(self, updated: set[str]) -> None:
+        """Load runtime dependencies when mitmproxy receives configuration."""
+        if "image_proxy_config" not in updated:
+            return
+
+        config_value = getattr(ctx.options, "image_proxy_config", "")
+        if not config_value:
+            raise OptionsError("image_proxy_config is required")
+
+        try:
+            config = load_config(Path(config_value))
+        except ConfigError as exc:
+            raise OptionsError(str(exc)) from exc
+
+        self._configure_runtime(config)
+
+    async def running(self) -> None:
+        """Start background maintenance after mitmproxy starts running."""
+        await self.start()
+
+    async def done(self) -> None:
+        """Release resources when mitmproxy shuts down."""
+        await self.shutdown()
+
     async def start(self) -> None:
         """Run startup cleanup and start one periodic-maintenance task."""
         async with self._lifecycle_lock:
@@ -165,6 +200,25 @@ class ImageProxyAddon:
             self._closed = True
             if caller_cancelled:
                 raise asyncio.CancelledError
+
+    def _configure_runtime(self, config: AppConfig) -> None:
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        if self.cache is not None:
+            self.cache.close()
+
+        self.config = config
+        self.matcher = UrlMatcher(config.matching)
+        self.processor = WatermarkProcessor(config.processing)
+        self.cache = CacheStore(config.cache)
+        self.cache.initialize()
+        self._executor = ThreadPoolExecutor(
+            max_workers=config.processing.workers,
+            thread_name_prefix="image-proxy",
+        )
+        self._closed = False
 
     async def request(self, flow: http.HTTPFlow) -> None:
         """Mark matching eligible requests for response-time processing."""
