@@ -343,8 +343,7 @@ class ImageProxyAddon:
     def _apply_cached_artifact(
         cls, response: http.Response, cached: CacheHit
     ) -> None:
-        for name in (*_STALE_REPRESENTATION_HEADERS, *_CACHE_RESPONSE_HEADERS):
-            response.headers.pop(name, None)
+        response.headers = http.Headers()
         response.headers.update(cls._cached_headers(cached))
         response.raw_content = cached.data
 
@@ -366,12 +365,14 @@ class ImageProxyAddon:
             )
             for name, value in cached.headers.items()
         )
-        headers = {
-            name: stored_headers[name]
-            for name in _CACHE_RESPONSE_HEADERS
-            if name in stored_headers
-        }
-        headers["Content-Type"] = cached.mime_type
+        headers = {"Content-Type": cached.mime_type}
+        headers.update(
+            {
+                name: stored_headers[name]
+                for name in _CACHE_RESPONSE_HEADERS
+                if name in stored_headers
+            }
+        )
         return headers
 
     @staticmethod

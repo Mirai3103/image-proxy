@@ -597,6 +597,52 @@ async def test_identical_concurrent_misses_commit_one_processed_artifact(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_miss_loser_replays_only_cached_headers(
+    addon, jpeg_bytes: bytes, monkeypatch
+) -> None:
+    process_started = threading.Event()
+    release_process = threading.Event()
+    original = addon.processor.process
+
+    def delayed_process(data: bytes, content_type: str | None):
+        process_started.set()
+        assert release_process.wait(timeout=2)
+        return original(data, content_type)
+
+    monkeypatch.setattr(addon.processor, "process", delayed_process)
+    winner = matching_flow(jpeg_bytes)
+    loser = matching_flow(jpeg_bytes)
+    winner.response.headers["Cache-Control"] = "public, max-age=60"
+    loser.response.headers["Cache-Control"] = "private, no-store"
+    loser.response.headers["Set-Cookie"] = "session=secret"
+    loser.response.headers["X-Upstream-Only"] = "loser-specific"
+
+    await addon.request(winner)
+    await addon.request(loser)
+    winner_task = asyncio.create_task(addon.response(winner))
+    assert await asyncio.to_thread(process_started.wait, 2)
+    loser_task = asyncio.create_task(addon.response(loser))
+    release_process.set()
+
+    await asyncio.gather(winner_task, loser_task)
+
+    assert loser.response.raw_content == winner.response.raw_content
+    assert loser.response.headers["Content-Type"] == "image/jpeg"
+    assert loser.response.headers["Access-Control-Allow-Origin"] == "*"
+    assert loser.response.headers["Cache-Control"] == "public, max-age=60"
+    assert "Set-Cookie" not in loser.response.headers
+    assert "X-Upstream-Only" not in loser.response.headers
+    assert {
+        name.decode("ascii")
+        for name, _ in loser.response.headers.fields
+    } == {
+        "Access-Control-Allow-Origin",
+        "Cache-Control",
+        "Content-Type",
+    }
+
+
+@pytest.mark.asyncio
 async def test_different_cache_keys_process_in_parallel(
     addon, jpeg_bytes: bytes, monkeypatch
 ) -> None:
