@@ -64,6 +64,86 @@ def test_missing_artifact_removes_broken_metadata(tmp_path: Path) -> None:
     assert count == 0
 
 
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("response_headers_json", "{"),
+        ("response_headers_json", '{"Cache-Control":7}'),
+        ("size_bytes", "wrong-size"),
+        ("expires_at", "not-a-timestamp"),
+    ],
+)
+def test_get_lazily_purges_corrupt_stored_metadata(
+    tmp_path: Path, column: str, value: object
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock)
+    key = "e" * 64
+    cache.put(key, "https://cdn.test/e.jpg", "fp", "image/jpeg", {}, b"processed")
+    artifact = tmp_path / "artifacts" / "ee" / (key + ".img")
+    connection = cache._connection
+    assert connection is not None
+    with connection:
+        connection.execute(
+            f"UPDATE entries SET {column} = ? WHERE cache_key = ?", (value, key)
+        )
+
+    assert cache.get(key) is None
+    assert not artifact.exists()
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
+        count = database.execute(
+            "SELECT COUNT(*) FROM entries WHERE cache_key = ?", (key,)
+        ).fetchone()[0]
+    assert count == 0
+
+
+def test_get_lazily_purges_artifact_with_wrong_recorded_size(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock)
+    key = "f" * 64
+    cache.put(key, "https://cdn.test/f.jpg", "fp", "image/jpeg", {}, b"processed")
+    artifact = tmp_path / "artifacts" / "ff" / (key + ".img")
+    artifact.write_bytes(b"tampered-artifact")
+
+    assert cache.get(key) is None
+    assert not artifact.exists()
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
+        count = database.execute(
+            "SELECT COUNT(*) FROM entries WHERE cache_key = ?", (key,)
+        ).fetchone()[0]
+    assert count == 0
+
+
+def test_get_rejects_invalid_artifact_layout_without_deleting_outside_tree(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock)
+    key = "1" * 64
+    cache.put(key, "https://cdn.test/one.jpg", "fp", "image/jpeg", {}, b"processed")
+    expected_artifact = tmp_path / "artifacts" / "11" / (key + ".img")
+    outside_artifact = tmp_path / "outside.img"
+    outside_artifact.write_bytes(b"outside-must-survive")
+    connection = cache._connection
+    assert connection is not None
+    with connection:
+        connection.execute(
+            "UPDATE entries SET artifact_path = ? WHERE cache_key = ?",
+            ("artifacts/../outside.img", key),
+        )
+
+    assert cache.get(key) is None
+    assert outside_artifact.read_bytes() == b"outside-must-survive"
+    assert not expected_artifact.exists()
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as database:
+        count = database.execute(
+            "SELECT COUNT(*) FROM entries WHERE cache_key = ?", (key,)
+        ).fetchone()[0]
+    assert count == 0
+
+
 def test_failed_metadata_write_after_replacement_never_serves_stale_metadata(
     tmp_path: Path,
 ) -> None:
@@ -164,6 +244,37 @@ def test_cleanup_removes_expired_rows_and_orphan_files(tmp_path: Path) -> None:
     assert report.orphan_count == 1
     assert cache.total_size_bytes() == 0
     assert not orphan.exists()
+
+
+def test_cleanup_removes_crash_temps_and_counts_all_orphan_bytes(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock)
+    key = "a" * 64
+    cache.put(key, "https://cdn/a", "fp", "image/jpeg", {}, b"tracked")
+    artifacts = tmp_path / "artifacts"
+    first_temp = artifacts / "aa" / ".cache-crash-one"
+    second_temp = artifacts / "bb" / ".cache-crash-two"
+    orphan = artifacts / "cc" / ("c" * 64 + ".img")
+    for path, data in (
+        (first_temp, b"temporary-one"),
+        (second_temp, b"two"),
+        (orphan, b"orphan"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    report = cache.cleanup()
+
+    assert report.orphan_count == 3
+    assert report.bytes_freed == (
+        len(b"temporary-one") + len(b"two") + len(b"orphan")
+    )
+    assert not first_temp.exists()
+    assert not second_temp.exists()
+    assert not orphan.exists()
+    assert cache.get(key).data == b"tracked"
 
 
 def test_cleanup_preserves_expired_artifact_when_metadata_delete_fails(
