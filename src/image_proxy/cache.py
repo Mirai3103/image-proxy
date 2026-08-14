@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -311,10 +312,10 @@ class CacheStore:
         artifact = self._config.directory / self._artifact_relative_path(key)
         try:
             artifacts_root = self._artifacts_directory.resolve(strict=False)
-            resolved_artifact = artifact.resolve(strict=False)
+            resolved_parent = artifact.parent.resolve(strict=False)
         except (OSError, RuntimeError):
             return None
-        if not resolved_artifact.is_relative_to(artifacts_root):
+        if not resolved_parent.is_relative_to(artifacts_root):
             return None
         return artifact
 
@@ -395,11 +396,16 @@ class CacheStore:
         if artifact is None:
             return 0
         try:
-            size_bytes = artifact.lstat().st_size
+            artifact_stat = artifact.lstat()
         except FileNotFoundError:
             return 0
+        if stat.S_ISDIR(artifact_stat.st_mode):
+            if not shutil.rmtree.avoids_symlink_attacks:
+                raise OSError("safe recursive artifact removal is unavailable")
+            shutil.rmtree(artifact)
+            return 0
         artifact.unlink()
-        return size_bytes
+        return artifact_stat.st_size
 
     def _cleanup_locked(self, connection: sqlite3.Connection) -> CleanupReport:
         expired_count = 0
@@ -451,10 +457,10 @@ class CacheStore:
                 ):
                     continue
                 try:
-                    size_bytes = artifact.lstat().st_size
-                    artifact.unlink()
+                    artifact.lstat()
                 except FileNotFoundError:
                     continue
+                size_bytes = self._unlink_artifact(artifact)
                 orphan_count += 1
                 bytes_freed += size_bytes
 

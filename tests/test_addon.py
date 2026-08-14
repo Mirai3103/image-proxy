@@ -316,7 +316,6 @@ async def test_content_encoded_jpeg_is_processed_from_decoded_body(
     [
         ("deflate", zlib.compress),
         ("deflateraw", raw_deflate),
-        ("br", brotli.compress),
         ("zstd", zstd.ZstdCompressor().compress),
     ],
 )
@@ -335,6 +334,36 @@ async def test_other_mitmproxy_supported_encodings_are_processed(
     assert "Content-Encoding" not in flow.response.headers
     with Image.open(BytesIO(flow.response.raw_content)) as image:
         assert image.format == "JPEG"
+
+
+@pytest.mark.asyncio
+async def test_brotli_fails_open_without_calling_unbounded_decoder(
+    addon, monkeypatch, caplog
+) -> None:
+    encoded_body = brotli.compress(b"x" * (16 * 1024**2))
+    assert len(encoded_body) == 27
+    flow = matching_flow(encoded_body)
+    flow.response.headers["Content-Encoding"] = "br"
+    flow.response.headers["ETag"] = '"upstream"'
+    flow.response.raw_content = encoded_body
+    original_headers = tuple(flow.response.headers.fields)
+    decoder_called = False
+
+    def forbidden_decoder():
+        nonlocal decoder_called
+        decoder_called = True
+        raise AssertionError("Brotli decoding must not be attempted")
+
+    monkeypatch.setattr(brotli, "Decompressor", forbidden_decoder)
+
+    with caplog.at_level(logging.WARNING):
+        await addon.request(flow)
+        await addon.response(flow)
+
+    assert not decoder_called
+    assert flow.response.raw_content == encoded_body
+    assert tuple(flow.response.headers.fields) == original_headers
+    assert "FALLBACK" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -920,6 +949,36 @@ async def test_shutdown_preserves_caller_cancellation_after_teardown(
 
 
 @pytest.mark.asyncio
+async def test_repeated_shutdown_cancellation_waits_for_runtime_teardown(
+    lifecycle_addon, monkeypatch
+) -> None:
+    close_started = threading.Event()
+    release_close = threading.Event()
+    original_close = lifecycle_addon.cache.close
+
+    def slow_close() -> None:
+        close_started.set()
+        assert release_close.wait(timeout=2)
+        original_close()
+
+    monkeypatch.setattr(lifecycle_addon.cache, "close", slow_close)
+    shutdown_task = asyncio.create_task(lifecycle_addon.shutdown())
+    assert await asyncio.to_thread(close_started.wait, 2)
+
+    shutdown_task.cancel()
+    await asyncio.sleep(0)
+    shutdown_task.cancel()
+    await asyncio.sleep(0)
+
+    assert not shutdown_task.done()
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(shutdown_task, timeout=2)
+    with pytest.raises(CacheError, match="not initialized"):
+        lifecycle_addon.cache.total_size_bytes()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_retries_cache_close_after_transient_failure(
     lifecycle_addon, monkeypatch
 ) -> None:
@@ -1199,6 +1258,96 @@ async def test_failed_live_reconfigure_preserves_working_runtime_until_done(
 
 
 @pytest.mark.asyncio
+async def test_candidate_cleanup_and_teardown_failures_preserve_old_runtime_and_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old_config = AppConfig(
+        ProxyConfig("127.0.0.1", 8080),
+        MatchingConfig(("*.old.test",), ()),
+        ProcessingConfig("OLD", 90, 90, 10 * 1024**2, 10_000_000, 1),
+        CacheConfig(tmp_path / "old-cache", 3600, 100 * 1024**2, 0.9, 9999, 25),
+    )
+    new_config = AppConfig(
+        ProxyConfig("127.0.0.1", 8080),
+        MatchingConfig(("*.new.test",), ()),
+        ProcessingConfig("NEW", 90, 90, 10 * 1024**2, 10_000_000, 1),
+        CacheConfig(tmp_path / "new-cache", 3600, 100 * 1024**2, 0.9, 9999, 25),
+    )
+
+    class FailingCandidateCacheStore(RecordingCacheStore):
+        def cleanup(self) -> CleanupReport:
+            if self._config.directory.name == "new-cache":
+                self.cleanup_count += 1
+                raise CacheError("candidate cleanup failed")
+            return super().cleanup()
+
+        def close(self) -> None:
+            if self._config.directory.name == "new-cache":
+                self.close_count += 1
+                if self.close_count == 1:
+                    raise CacheError("candidate close failed")
+                CacheStore.close(self)
+                return
+            super().close()
+
+    def fake_load_config(path: Path) -> AppConfig:
+        return old_config if path.name == "old.yaml" else new_config
+
+    RecordingCacheStore.instances = []
+    instance = ImageProxyAddon()
+    monkeypatch.setattr("image_proxy.addon.CacheStore", FailingCandidateCacheStore)
+    monkeypatch.setattr("image_proxy.addon.load_config", fake_load_config)
+    options = SimpleNamespace(image_proxy_config=str(tmp_path / "old.yaml"))
+    monkeypatch.setattr("image_proxy.addon.ctx", SimpleNamespace(options=options))
+
+    instance.configure({"image_proxy_config"})
+    old_runtime = instance._runtime
+    assert old_runtime is not None
+    await instance.running()
+    old_task = instance.maintenance_task
+    old_state = (
+        instance._runtime,
+        instance.config,
+        instance.matcher,
+        instance.processor,
+        instance.cache,
+        instance._executor,
+        instance.maintenance_task,
+    )
+    options.image_proxy_config = str(tmp_path / "new.yaml")
+
+    instance.configure({"image_proxy_config"})
+    await wait_until(
+        lambda: bool(instance._lifecycle_tasks)
+        and all(task.done() for task in instance._lifecycle_tasks)
+    )
+    candidate_cache = RecordingCacheStore.instances[-1]
+
+    assert (
+        instance._runtime,
+        instance.config,
+        instance.matcher,
+        instance.processor,
+        instance.cache,
+        instance._executor,
+        instance.maintenance_task,
+    ) == old_state
+    assert old_task is not None and not old_task.done()
+    assert old_runtime.cache.close_count == 0
+    assert candidate_cache.cleanup_count == 1
+    assert candidate_cache.close_count == 1
+
+    with pytest.raises(CacheError, match="candidate close failed"):
+        await instance.done()
+
+    assert candidate_cache.close_count == 2
+    assert old_runtime.cache.close_count == 1
+    assert old_task.cancelled()
+    with pytest.raises(CacheError, match="not initialized"):
+        candidate_cache.total_size_bytes()
+
+
+@pytest.mark.asyncio
 async def test_live_reconfigure_retires_slow_old_cache_without_blocking_loop(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1261,6 +1410,69 @@ async def test_live_reconfigure_retires_slow_old_cache_without_blocking_loop(
     assert old_cache.close_count == 1
     assert new_cache.close_count == 1
     assert instance.maintenance_task is None
+
+
+@pytest.mark.asyncio
+async def test_failed_retirement_is_retried_before_done_propagates_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old_config = AppConfig(
+        ProxyConfig("127.0.0.1", 8080),
+        MatchingConfig(("*.old.test",), ()),
+        ProcessingConfig("OLD", 90, 90, 10 * 1024**2, 10_000_000, 1),
+        CacheConfig(tmp_path / "old-cache", 3600, 100 * 1024**2, 0.9, 9999, 25),
+    )
+    new_config = AppConfig(
+        ProxyConfig("127.0.0.1", 8080),
+        MatchingConfig(("*.new.test",), ()),
+        ProcessingConfig("NEW", 90, 90, 10 * 1024**2, 10_000_000, 1),
+        CacheConfig(tmp_path / "new-cache", 3600, 100 * 1024**2, 0.9, 9999, 25),
+    )
+
+    class FailFirstRetirementCacheStore(RecordingCacheStore):
+        def close(self) -> None:
+            if self._config.directory.name == "old-cache":
+                self.close_count += 1
+                if self.close_count == 1:
+                    raise CacheError("old retirement failed")
+                CacheStore.close(self)
+                return
+            super().close()
+
+    def fake_load_config(path: Path) -> AppConfig:
+        return old_config if path.name == "old.yaml" else new_config
+
+    RecordingCacheStore.instances = []
+    instance = ImageProxyAddon()
+    monkeypatch.setattr("image_proxy.addon.CacheStore", FailFirstRetirementCacheStore)
+    monkeypatch.setattr("image_proxy.addon.load_config", fake_load_config)
+    options = SimpleNamespace(image_proxy_config=str(tmp_path / "old.yaml"))
+    monkeypatch.setattr("image_proxy.addon.ctx", SimpleNamespace(options=options))
+
+    instance.configure({"image_proxy_config"})
+    old_cache = RecordingCacheStore.instances[-1]
+    await instance.running()
+    options.image_proxy_config = str(tmp_path / "new.yaml")
+    instance.configure({"image_proxy_config"})
+    await wait_until(
+        lambda: bool(instance._lifecycle_tasks)
+        and all(task.done() for task in instance._lifecycle_tasks)
+    )
+    new_cache = RecordingCacheStore.instances[-1]
+
+    assert instance.cache is new_cache
+    assert old_cache.close_count == 1
+    assert new_cache.close_count == 0
+
+    with pytest.raises(CacheError, match="old retirement failed"):
+        await instance.done()
+
+    assert old_cache.close_count == 2
+    assert new_cache.close_count == 1
+    with pytest.raises(CacheError, match="not initialized"):
+        old_cache.total_size_bytes()
+    with pytest.raises(CacheError, match="not initialized"):
+        new_cache.total_size_bytes()
 
 
 @pytest.mark.asyncio

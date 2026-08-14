@@ -15,7 +15,6 @@ from typing import TypeVar
 from urllib.parse import urlsplit
 import zlib
 
-import brotli
 from mitmproxy import ctx, http
 from mitmproxy.exceptions import OptionsError
 import zstandard as zstd
@@ -92,7 +91,6 @@ def _decode_content(
         item.strip().lower() for item in content_encoding.split(",")
     ]
     supported_encodings = {
-        "br",
         "deflate",
         "deflateraw",
         "gzip",
@@ -118,10 +116,6 @@ def _decode_content(
                 )
             elif normalized in {"deflate", "deflateraw"}:
                 decoded_content = _decode_deflate_bounded(
-                    decoded_content, max_decoded_bytes
-                )
-            elif normalized == "br":
-                decoded_content = _decode_brotli_bounded(
                     decoded_content, max_decoded_bytes
                 )
             else:
@@ -168,23 +162,6 @@ def _decode_zlib_bounded(
     if not decompressor.eof:
         raise zlib.error("incomplete compressed stream")
     return decoded
-
-
-def _decode_brotli_bounded(content: bytes, max_decoded_bytes: int) -> bytes:
-    if not content:
-        return b""
-    decompressor = brotli.Decompressor()
-    decoded_chunks: list[bytes] = []
-    decoded_size = 0
-    for offset in range(0, len(content), 16 * 1024):
-        chunk = decompressor.process(content[offset : offset + 16 * 1024])
-        decoded_size += len(chunk)
-        if decoded_size > max_decoded_bytes:
-            raise ValueError("decoded response content exceeds source byte limit")
-        decoded_chunks.append(chunk)
-    if not decompressor.is_finished():
-        raise ValueError("incomplete compressed stream")
-    return b"".join(decoded_chunks)
 
 
 def _decode_zstd_bounded(content: bytes, max_decoded_bytes: int) -> bytes:
@@ -239,6 +216,7 @@ class ImageProxyAddon:
         self._key_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._lifecycle_tasks: set[asyncio.Task[None]] = set()
+        self._runtimes_pending_teardown: list[_Runtime] = []
         self._maintenance_task: asyncio.Task[None] | None = None
         self._closed = False
         self._running = False
@@ -324,8 +302,17 @@ class ImageProxyAddon:
         except BaseException as exc:
             lifecycle_error = exc
 
+        teardown_task = asyncio.create_task(
+            self._shutdown_current_runtime(),
+            name="image-proxy-shutdown-teardown",
+        )
+        while not teardown_task.done():
+            try:
+                await asyncio.shield(teardown_task)
+            except asyncio.CancelledError:
+                caller_cancelled = True
         try:
-            await self._shutdown_current_runtime()
+            teardown_task.result()
         except asyncio.CancelledError:
             caller_cancelled = True
         except BaseException as exc:
@@ -340,13 +327,38 @@ class ImageProxyAddon:
 
     async def _shutdown_current_runtime(self) -> None:
         async with self._lifecycle_lock:
-            if self._closed:
+            if self._closed and not self._runtimes_pending_teardown:
                 return
             caller_cancelled = await self._cancel_maintenance_task()
-            runtime = self._runtime
-            if runtime is not None:
-                await self._retire_runtime(runtime)
-            self._closed = True
+            first_error: BaseException | None = None
+            current_runtime = self._runtime
+            current_attempted = False
+            for pending_runtime in tuple(self._runtimes_pending_teardown):
+                if pending_runtime is current_runtime:
+                    current_attempted = True
+                try:
+                    await self._retire_runtime(pending_runtime)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                else:
+                    if pending_runtime is current_runtime:
+                        self._closed = True
+
+            runtime = current_runtime
+            if not self._closed and not current_attempted and runtime is not None:
+                try:
+                    await self._retire_runtime(runtime)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                else:
+                    self._closed = True
+            elif runtime is None:
+                self._closed = True
+
+            if first_error is not None:
+                raise first_error
             if caller_cancelled:
                 raise asyncio.CancelledError
 
@@ -382,14 +394,10 @@ class ImageProxyAddon:
                 await self._run_runtime_blocking(
                     candidate, candidate.cache.initialize
                 )
-                try:
-                    report = await self._run_runtime_blocking(
-                        candidate, candidate.cache.cleanup
-                    )
-                except Exception as exc:
-                    self._log_maintenance_fallback(exc)
-                else:
-                    self._log_evicted(report)
+                report = await self._run_runtime_blocking(
+                    candidate, candidate.cache.cleanup
+                )
+                self._log_evicted(report)
 
                 old_runtime = self._runtime
                 caller_cancelled = await self._cancel_maintenance_task()
@@ -439,6 +447,9 @@ class ImageProxyAddon:
         caller_cancelled = False
         if not maintenance_task.done():
             maintenance_task.cancel()
+            await asyncio.sleep(0)
+            if not maintenance_task.done():
+                maintenance_task.cancel()
         while not maintenance_task.done():
             try:
                 await asyncio.shield(maintenance_task)
@@ -473,6 +484,8 @@ class ImageProxyAddon:
         self._closed = False
 
     async def _retire_runtime(self, runtime: _Runtime) -> None:
+        if runtime not in self._runtimes_pending_teardown:
+            self._runtimes_pending_teardown.append(runtime)
         await runtime.idle.wait()
         executor = runtime.executor
         if executor is not None:
@@ -488,6 +501,7 @@ class ImageProxyAddon:
                     self._executor = None
         else:
             await asyncio.to_thread(runtime.cache.close)
+        self._runtimes_pending_teardown.remove(runtime)
 
     def _close_runtime_sync(self, runtime: _Runtime) -> None:
         executor = runtime.executor

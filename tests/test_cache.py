@@ -116,6 +116,33 @@ def test_get_lazily_purges_artifact_with_wrong_recorded_size(
     assert count == 0
 
 
+def test_get_removes_canonical_artifact_directory_without_following_symlinks(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock)
+    key = "2" * 64
+    cache.put(key, "https://cdn.test/two.jpg", "fp", "image/jpeg", {}, b"old")
+    artifact = tmp_path / "artifacts" / "22" / (key + ".img")
+    artifact.unlink()
+    artifact.mkdir()
+    (artifact / "nested").mkdir()
+    (artifact / "nested" / "poison").write_bytes(b"poison")
+    outside_sentinel = tmp_path / "outside-sentinel"
+    outside_sentinel.write_bytes(b"outside-must-survive")
+    (artifact / "outside-link").symlink_to(outside_sentinel)
+
+    assert cache.get(key) is None
+    assert not artifact.exists()
+    assert outside_sentinel.read_bytes() == b"outside-must-survive"
+    assert cache.get(key) is None
+
+    cache.put(key, "https://cdn.test/two.jpg", "fp", "image/jpeg", {}, b"new")
+    hit = cache.get(key)
+    assert hit is not None
+    assert hit.data == b"new"
+
+
 def test_get_rejects_invalid_artifact_layout_without_deleting_outside_tree(
     tmp_path: Path,
 ) -> None:
@@ -275,6 +302,31 @@ def test_cleanup_removes_crash_temps_and_counts_all_orphan_bytes(
     assert not second_temp.exists()
     assert not orphan.exists()
     assert cache.get(key).data == b"tracked"
+
+
+def test_cleanup_removes_canonical_artifact_directory_without_following_symlinks(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    cache = store(tmp_path, clock)
+    key = "3" * 64
+    cache.put(key, "https://cdn.test/three.jpg", "fp", "image/jpeg", {}, b"old")
+    artifact = tmp_path / "artifacts" / "33" / (key + ".img")
+    artifact.unlink()
+    artifact.mkdir()
+    (artifact / "nested").mkdir()
+    (artifact / "nested" / "poison").write_bytes(b"poison")
+    outside_sentinel = tmp_path / "outside-sentinel"
+    outside_sentinel.write_bytes(b"outside-must-survive")
+    (artifact / "outside-link").symlink_to(outside_sentinel)
+
+    report = cache.cleanup()
+
+    assert report.orphan_count == 1
+    assert not artifact.exists()
+    assert outside_sentinel.read_bytes() == b"outside-must-survive"
+    assert cache.get(key) is None
+    assert cache.cleanup().orphan_count == 0
 
 
 def test_cleanup_preserves_expired_artifact_when_metadata_delete_fails(
