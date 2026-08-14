@@ -17,11 +17,18 @@ def test_domain_globs_become_anchored_host_port_regexes() -> None:
     assert not re.search(wildcard, "img.cdn.test.evil:8443")
 
 
-def test_build_command_uses_validated_listener_and_absolute_paths(
+def test_build_command_uses_listener_allowlist_and_absolute_paths(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(Path("config.example.yaml").read_text())
+    config_path.write_text(
+        Path("config.example.yaml")
+        .read_text()
+        .replace(
+            '    - "*.example-cdn.com"',
+            '    - "zs.wtcdn.xyz"\n    - "*.example-cdn.com"',
+        )
+    )
     config = load_config(config_path)
     command = build_mitmdump_command(
         config_path, config, "/venv/bin/mitmdump", Path("/package/mitm_script.py")
@@ -32,6 +39,8 @@ def test_build_command_uses_validated_listener_and_absolute_paths(
         "0.0.0.0",
         "--listen-port",
         "8080",
+        "--allow-hosts",
+        domain_glob_to_allow_hosts_regex("zs.wtcdn.xyz"),
         "--allow-hosts",
         domain_glob_to_allow_hosts_regex("*.example-cdn.com"),
         "--set",
