@@ -20,6 +20,8 @@ from cryptography.x509.oid import NameOID
 from PIL import Image
 
 import image_proxy.mitm_script
+from image_proxy.config import load_config
+from image_proxy.runner import build_mitmdump_command
 
 
 class _FakeOrigin:
@@ -254,7 +256,7 @@ def test_live_proxy_processes_then_serves_cache_without_origin(
             yaml.safe_dump(
                 {
                     "proxy": {"host": "127.0.0.1", "port": proxy_port},
-                    "matching": {"domains": ["127.0.0.1"], "url_regex": []},
+                    "matching": {"domains": ["localhost"], "url_regex": []},
                     "processing": {
                         "text": "UPSCALED",
                         "jpeg_quality": 90,
@@ -279,29 +281,28 @@ def test_live_proxy_processes_then_serves_cache_without_origin(
         executable = shutil.which("mitmdump")
         assert executable is not None
         log_file = (tmp_path / "mitmdump.log").open("wb")
-        process = subprocess.Popen(
-            [
+        command = [
+            executable,
+            "--set",
+            f"confdir={confdir}",
+            "--set",
+            "ssl_insecure=true",
+            *build_mitmdump_command(
+                config_path,
+                load_config(config_path),
                 executable,
-                "--listen-host",
-                "127.0.0.1",
-                "--listen-port",
-                str(proxy_port),
-                "--set",
-                f"confdir={confdir}",
-                "--set",
-                "ssl_insecure=true",
-                "--set",
-                f"image_proxy_config={config_path}",
-                "-s",
-                str(script_path),
-            ],
+                script_path,
+            )[1:],
+        ]
+        process = subprocess.Popen(
+            command,
             stdout=log_file,
             stderr=subprocess.STDOUT,
         )
         ca_path = confdir / "mitmproxy-ca-cert.pem" if tls else None
         wait_for_port(proxy_port, ca_path)
         scheme = "https" if tls else "http"
-        url = f"{scheme}://127.0.0.1:{origin.server_port}/manga/page.jpg"
+        url = f"{scheme}://localhost:{origin.server_port}/manga/page.jpg"
         first, second = tmp_path / "first.jpg", tmp_path / "second.jpg"
         curl = [
             "curl",
@@ -313,12 +314,39 @@ def test_live_proxy_processes_then_serves_cache_without_origin(
             "--proxy",
             f"http://127.0.0.1:{proxy_port}",
         ]
+        intercepted_curl = [*curl]
         if tls:
-            curl.extend(["--cacert", str(ca_path)])
-        subprocess.run([*curl, url, "--output", str(first)], check=True, timeout=10)
+            intercepted_curl.extend(["--cacert", str(ca_path)])
+        subprocess.run(
+            [*intercepted_curl, url, "--output", str(first)],
+            check=True,
+            timeout=10,
+        )
+        if tls:
+            tunneled = tmp_path / "tunneled.jpg"
+            tunneled_url = (
+                f"https://127.0.0.1:{origin.server_port}/manga/page.jpg"
+            )
+            subprocess.run(
+                [
+                    *curl,
+                    "--cacert",
+                    str(tmp_path / "origin.crt"),
+                    tunneled_url,
+                    "--output",
+                    str(tunneled),
+                ],
+                check=True,
+                timeout=10,
+            )
+            assert tunneled.read_bytes() == source
         stop_origin(origin, origin_thread)
         origin_stopped = True
-        subprocess.run([*curl, url, "--output", str(second)], check=True, timeout=10)
+        subprocess.run(
+            [*intercepted_curl, url, "--output", str(second)],
+            check=True,
+            timeout=10,
+        )
 
         assert first.read_bytes() == second.read_bytes()
         assert first.read_bytes() != source
