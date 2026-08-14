@@ -2,11 +2,28 @@ from image_proxy.config import MatchingConfig
 from image_proxy.matcher import UrlMatcher, build_cache_key, is_eligible_request
 
 
-def test_matcher_uses_domain_or_full_url_regex() -> None:
-    matcher = UrlMatcher(MatchingConfig(("*.cdn.test",), (r"/manga/\d+",)))
-    assert matcher.matches("img.cdn.test", "https://img.cdn.test/page.webp")
-    assert matcher.matches("other.test", "https://other.test/manga/42/page")
-    assert not matcher.matches("cdn.test", "https://cdn.test/not-selected")
+def test_matcher_requires_domain_and_full_url_regex() -> None:
+    matcher = UrlMatcher(MatchingConfig(("*.cdn.test",), (r"chapter.*\.webp$",)))
+
+    assert matcher.matches(
+        "img.cdn.test", "https://img.cdn.test/chapter-73/1.webp"
+    )
+    assert not matcher.matches(
+        "img.cdn.test", "https://img.cdn.test/cover.webp"
+    )
+    assert not matcher.matches(
+        "other.test", "https://other.test/chapter-73/1.webp"
+    )
+    assert not matcher.matches(
+        "img.cdn.test", "https://img.cdn.test/chapter-73/1.webp?x=1"
+    )
+
+
+def test_empty_url_regex_matches_every_url_on_allowed_domain() -> None:
+    matcher = UrlMatcher(MatchingConfig(("*.cdn.test",), ()))
+
+    assert matcher.matches("img.cdn.test", "https://img.cdn.test/cover.webp")
+    assert not matcher.matches("other.test", "https://other.test/cover.webp")
 
 
 def test_empty_rules_match_nothing() -> None:

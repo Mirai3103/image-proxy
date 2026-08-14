@@ -44,6 +44,14 @@ def test_load_config_converts_units_and_resolves_cache_path(tmp_path: Path) -> N
     assert config.cache.directory == tmp_path / "data/cache"
 
 
+def test_load_config_rejects_empty_matching_domains(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID.replace('domains: ["*.cdn.test"]', "domains: []"))
+
+    with pytest.raises(ConfigError, match="matching.domains must contain"):
+        load_config(path)
+
+
 @pytest.mark.parametrize(
     ("old", "new", "message"),
     [

@@ -11,19 +11,23 @@ from image_proxy.config import MatchingConfig
 
 
 class UrlMatcher:
-    """Match requests against configured domain globs or URL regexes."""
+    """Match requests against configured domain globs and URL regexes."""
 
     def __init__(self, config: MatchingConfig) -> None:
         self._domains = config.domains
         self._url_patterns = tuple(re.compile(pattern) for pattern in config.url_regex)
 
     def matches(self, host: str, url: str) -> bool:
-        """Return whether *host* or *url* satisfies a configured rule."""
+        """Return whether *host* and *url* satisfy their configured rules."""
         normalized_host = host.lower()
-        return any(
+        domain_matches = any(
             fnmatch.fnmatchcase(normalized_host, pattern.lower())
             for pattern in self._domains
-        ) or any(pattern.search(url) for pattern in self._url_patterns)
+        )
+        return domain_matches and (
+            not self._url_patterns
+            or any(pattern.search(url) for pattern in self._url_patterns)
+        )
 
 
 def is_eligible_request(method: str, headers: Mapping[str, str]) -> bool:

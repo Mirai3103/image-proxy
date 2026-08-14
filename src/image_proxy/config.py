@@ -135,6 +135,8 @@ def load_config(path: Path) -> AppConfig:
 
     matching_data = _section(root, "matching", {"domains", "url_regex"})
     domains = _string_tuple(matching_data["domains"], "matching.domains")
+    if not domains:
+        raise ConfigError("matching.domains must contain at least one hostname glob")
     url_regex = _string_tuple(matching_data["url_regex"], "matching.url_regex")
     for index, pattern in enumerate(url_regex):
         try:
