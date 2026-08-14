@@ -1,8 +1,20 @@
 from pathlib import Path
+import re
 
 from image_proxy.config import load_config
 from image_proxy import runner
-from image_proxy.runner import build_mitmdump_command
+from image_proxy.runner import build_mitmdump_command, domain_glob_to_allow_hosts_regex
+
+
+def test_domain_globs_become_anchored_host_port_regexes() -> None:
+    exact = domain_glob_to_allow_hosts_regex("zs.wtcdn.xyz")
+    wildcard = domain_glob_to_allow_hosts_regex("*.cdn.test")
+
+    assert re.search(exact, "zs.wtcdn.xyz:443")
+    assert not re.search(exact, "evil-zs.wtcdn.xyz:443")
+    assert not re.search(exact, "zs.wtcdn.xyz.evil:443")
+    assert re.search(wildcard, "img.cdn.test:8443")
+    assert not re.search(wildcard, "img.cdn.test.evil:8443")
 
 
 def test_build_command_uses_validated_listener_and_absolute_paths(
@@ -20,6 +32,8 @@ def test_build_command_uses_validated_listener_and_absolute_paths(
         "0.0.0.0",
         "--listen-port",
         "8080",
+        "--allow-hosts",
+        domain_glob_to_allow_hosts_regex("*.example-cdn.com"),
         "--set",
         f"image_proxy_config={config_path.resolve()}",
         "-s",
@@ -68,6 +82,8 @@ def test_main_runs_mitmdump_command_and_returns_exit_code(
                 "0.0.0.0",
                 "--listen-port",
                 "8080",
+                "--allow-hosts",
+                domain_glob_to_allow_hosts_regex("*.example-cdn.com"),
                 "--set",
                 f"image_proxy_config={config_path.resolve()}",
                 "-s",

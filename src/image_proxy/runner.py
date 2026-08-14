@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,6 +13,13 @@ from collections.abc import Sequence
 from image_proxy.config import AppConfig, ConfigError, load_config
 
 
+def domain_glob_to_allow_hosts_regex(domain_glob: str) -> str:
+    """Convert a hostname glob to an anchored mitmproxy host:port regex."""
+    translated = fnmatch.translate(domain_glob)
+    assert translated.endswith(r"\Z")
+    return rf"\A{translated[:-2]}:\d+\Z"
+
+
 def build_mitmdump_command(
     config_path: Path,
     config: AppConfig,
@@ -19,12 +27,18 @@ def build_mitmdump_command(
     script_path: Path,
 ) -> list[str]:
     """Build the mitmdump command from already validated configuration."""
+    allow_hosts_args = [
+        argument
+        for domain in config.matching.domains
+        for argument in ("--allow-hosts", domain_glob_to_allow_hosts_regex(domain))
+    ]
     return [
         executable,
         "--listen-host",
         config.proxy.host,
         "--listen-port",
         str(config.proxy.port),
+        *allow_hosts_args,
         "--set",
         f"image_proxy_config={config_path.resolve()}",
         "-s",
