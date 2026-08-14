@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import gzip
 import logging
 import threading
@@ -6,13 +7,15 @@ import time
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+import zlib
 
+import brotli
 import pytest
 from mitmproxy.exceptions import OptionsError
 from mitmproxy import http
-from mitmproxy.net import encoding
 from mitmproxy.test import tflow
 from PIL import Image
+import zstandard as zstd
 
 from image_proxy.addon import ImageProxyAddon
 from image_proxy.cache import CacheError, CacheStore, CleanupReport
@@ -31,6 +34,11 @@ def encoded_image(format_name: str) -> bytes:
     output = BytesIO()
     Image.new("RGB", (240, 320), "white").save(output, format_name)
     return output.getvalue()
+
+
+def raw_deflate(data: bytes) -> bytes:
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    return compressor.compress(data) + compressor.flush()
 
 
 @pytest.fixture
@@ -295,6 +303,33 @@ async def test_content_encoded_jpeg_is_processed_from_decoded_body(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_encoding", "encode"),
+    [
+        ("deflate", zlib.compress),
+        ("deflateraw", raw_deflate),
+        ("br", brotli.compress),
+        ("zstd", zstd.ZstdCompressor().compress),
+    ],
+)
+async def test_other_mitmproxy_supported_encodings_are_processed(
+    addon, jpeg_bytes: bytes, content_encoding: str, encode
+) -> None:
+    encoded_body = encode(jpeg_bytes)
+    flow = matching_flow(encoded_body)
+    flow.response.headers["Content-Encoding"] = content_encoding
+    flow.response.raw_content = encoded_body
+
+    await addon.request(flow)
+    await addon.response(flow)
+
+    assert flow.response.raw_content != encoded_body
+    assert "Content-Encoding" not in flow.response.headers
+    with Image.open(BytesIO(flow.response.raw_content)) as image:
+        assert image.format == "JPEG"
+
+
+@pytest.mark.asyncio
 async def test_content_decoding_and_processing_run_off_event_loop_thread(
     addon, jpeg_bytes: bytes, monkeypatch
 ) -> None:
@@ -303,13 +338,13 @@ async def test_content_decoding_and_processing_run_off_event_loop_thread(
     flow.response.raw_content = gzip.compress(jpeg_bytes, mtime=1)
     event_loop_thread = threading.get_ident()
     decode_threads: list[int] = []
-    real_decode_gzip = encoding.custom_decode["gzip"]
+    real_read = gzip.GzipFile.read
 
-    def recording_real_decode(encoded: bytes) -> bytes:
+    def recording_read(file: gzip.GzipFile, size: int = -1) -> bytes:
         decode_threads.append(threading.get_ident())
-        return real_decode_gzip(encoded)
+        return real_read(file, size)
 
-    monkeypatch.setitem(encoding.custom_decode, "gzip", recording_real_decode)
+    monkeypatch.setattr(gzip.GzipFile, "read", recording_read)
 
     await addon.request(flow)
     await addon.response(flow)
@@ -322,6 +357,57 @@ async def test_content_decoding_and_processing_run_off_event_loop_thread(
 
 
 @pytest.mark.asyncio
+async def test_gzip_expansion_stops_at_source_limit_and_restores_response(
+    addon, monkeypatch, caplog
+) -> None:
+    limit = addon.config.processing.max_source_bytes
+    encoded_body = gzip.compress(b"x" * (limit + 1), compresslevel=9, mtime=1)
+    flow = matching_flow(encoded_body)
+    flow.response.headers["Content-Encoding"] = "gzip"
+    flow.response.headers["ETag"] = '"upstream"'
+    flow.response.raw_content = encoded_body
+    original_headers = tuple(flow.response.headers.fields)
+    read_sizes: list[int] = []
+    real_read = gzip.GzipFile.read
+
+    def recording_read(file: gzip.GzipFile, size: int = -1) -> bytes:
+        read_sizes.append(size)
+        return real_read(file, size)
+
+    monkeypatch.setattr(gzip.GzipFile, "read", recording_read)
+
+    with caplog.at_level(logging.WARNING):
+        await addon.request(flow)
+        await addon.response(flow)
+
+    assert read_sizes
+    assert all(0 <= size <= limit + 1 for size in read_sizes)
+    assert flow.response.raw_content == encoded_body
+    assert tuple(flow.response.headers.fields) == original_headers
+    assert "FALLBACK" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unknown_python_codec_content_encoding_restores_response(
+    addon, jpeg_bytes: bytes, caplog
+) -> None:
+    encoded_body = base64.b64encode(jpeg_bytes)
+    flow = matching_flow(encoded_body)
+    flow.response.headers["Content-Encoding"] = "base64"
+    flow.response.headers["ETag"] = '"upstream"'
+    flow.response.raw_content = encoded_body
+    original_headers = tuple(flow.response.headers.fields)
+
+    with caplog.at_level(logging.WARNING):
+        await addon.request(flow)
+        await addon.response(flow)
+
+    assert flow.response.raw_content == encoded_body
+    assert tuple(flow.response.headers.fields) == original_headers
+    assert "FALLBACK" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_concurrent_gzip_flows_keep_decoded_bodies_with_their_cache_keys(
     addon, monkeypatch
 ) -> None:
@@ -331,44 +417,20 @@ async def test_concurrent_gzip_flows_keep_decoded_bodies_with_their_cache_keys(
     Image.new("RGB", (240, 320), "black").save(second_source, "JPEG")
     first_encoded = gzip.compress(first_source.getvalue(), mtime=1)
     second_encoded = gzip.compress(second_source.getvalue(), mtime=2)
-    first_cache_check_started = threading.Event()
-    second_cache_committed = threading.Event()
+    decoders_met = threading.Barrier(2)
+    seen_decoders: set[int] = set()
+    seen_guard = threading.Lock()
+    real_read = gzip.GzipFile.read
 
-    class CoordinatedCachedBytes(bytes):
-        def __eq__(self, other) -> bool:
-            equal = bytes.__eq__(self, other)
-            if equal:
-                first_cache_check_started.set()
-                if not second_cache_committed.wait(timeout=2):
-                    raise AssertionError("second decode did not replace the shared cache")
-            return equal
+    def coordinated_read(file: gzip.GzipFile, size: int = -1) -> bytes:
+        with seen_guard:
+            first_read = id(file) not in seen_decoders
+            seen_decoders.add(id(file))
+        if first_read:
+            decoders_met.wait(timeout=2)
+        return real_read(file, size)
 
-        __hash__ = bytes.__hash__
-
-    monkeypatch.setattr(
-        encoding,
-        "_cache",
-        encoding.CachedDecode(
-            CoordinatedCachedBytes(first_encoded),
-            "gzip",
-            "strict",
-            first_source.getvalue(),
-        ),
-    )
-    real_decode = encoding.decode
-
-    def coordinated_real_decode(
-        encoded: None | str | bytes, content_encoding: str, errors: str = "strict"
-    ) -> None | str | bytes:
-        is_second = isinstance(encoded, bytes) and encoded == second_encoded
-        if is_second and not first_cache_check_started.wait(timeout=2):
-            raise AssertionError("first decode did not begin its cache check")
-        decoded = real_decode(encoded, content_encoding, errors)
-        if is_second:
-            second_cache_committed.set()
-        return decoded
-
-    monkeypatch.setattr(encoding, "decode", coordinated_real_decode)
+    monkeypatch.setattr(gzip.GzipFile, "read", coordinated_read)
 
     first = matching_flow(first_encoded)
     first.request.url = "https://img.cdn.test/manga/first.jpg"

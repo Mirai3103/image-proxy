@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
+import gzip
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from io import BytesIO
 import logging
 from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlsplit
+import zlib
 
+import brotli
 from mitmproxy import ctx, http
 from mitmproxy.exceptions import OptionsError
-from mitmproxy.net import encoding
+import zstandard as zstd
 
 from image_proxy.cache import CacheError, CacheHit, CacheStore, CleanupReport
 from image_proxy.config import AppConfig, ConfigError, load_config
@@ -56,26 +59,127 @@ def _decode_and_process(
     raw_content: bytes,
     content_encoding: str | None,
     content_type: str | None,
+    max_decoded_bytes: int,
 ) -> ProcessedImage:
-    decoded_content = _decode_content(raw_content, content_encoding)
-    if not isinstance(decoded_content, bytes):
-        raise ValueError("decoded response content is not bytes")
+    decoded_content = _decode_content(
+        raw_content, content_encoding, max_decoded_bytes
+    )
     return processor.process(decoded_content, content_type)
 
 
-def _decode_content(raw_content: bytes, content_encoding: str | None) -> str | bytes:
+def _decode_content(
+    raw_content: bytes, content_encoding: str | None, max_decoded_bytes: int
+) -> bytes:
     if not content_encoding:
-        return raw_content
-    normalized = content_encoding.lower()
+        return _bounded_identity(raw_content, max_decoded_bytes)
+
+    normalized_encodings = [
+        item.strip().lower() for item in content_encoding.split(",")
+    ]
+    supported_encodings = {
+        "br",
+        "deflate",
+        "deflateraw",
+        "gzip",
+        "identity",
+        "none",
+        "zstd",
+    }
+    if not all(
+        item and item in supported_encodings for item in normalized_encodings
+    ):
+        raise ValueError("unsupported Content-Encoding")
+
+    decoded_content = raw_content
     try:
-        decoder = encoding.custom_decode.get(normalized)
-        if decoder is not None:
-            return decoder(raw_content)
-        return codecs.decode(raw_content, normalized, "strict")
-    except TypeError:
+        for normalized in reversed(normalized_encodings):
+            if normalized in {"identity", "none"}:
+                decoded_content = _bounded_identity(
+                    decoded_content, max_decoded_bytes
+                )
+            elif normalized == "gzip":
+                decoded_content = _decode_gzip_bounded(
+                    decoded_content, max_decoded_bytes
+                )
+            elif normalized in {"deflate", "deflateraw"}:
+                decoded_content = _decode_deflate_bounded(
+                    decoded_content, max_decoded_bytes
+                )
+            elif normalized == "br":
+                decoded_content = _decode_brotli_bounded(
+                    decoded_content, max_decoded_bytes
+                )
+            else:
+                decoded_content = _decode_zstd_bounded(
+                    decoded_content, max_decoded_bytes
+                )
+        return decoded_content
+    except ValueError:
         raise
     except Exception as exc:
         raise ValueError("could not decode response content") from exc
+
+
+def _bounded_identity(content: bytes, max_decoded_bytes: int) -> bytes:
+    if len(content) > max_decoded_bytes:
+        raise ValueError("decoded response content exceeds source byte limit")
+    return content
+
+
+def _decode_gzip_bounded(content: bytes, max_decoded_bytes: int) -> bytes:
+    if not content:
+        return b""
+    with gzip.GzipFile(fileobj=BytesIO(content)) as compressed:
+        decoded = compressed.read(max_decoded_bytes + 1)
+    return _bounded_identity(decoded, max_decoded_bytes)
+
+
+def _decode_deflate_bounded(content: bytes, max_decoded_bytes: int) -> bytes:
+    if not content:
+        return b""
+    try:
+        return _decode_zlib_bounded(content, zlib.MAX_WBITS, max_decoded_bytes)
+    except zlib.error:
+        return _decode_zlib_bounded(content, -zlib.MAX_WBITS, max_decoded_bytes)
+
+
+def _decode_zlib_bounded(
+    content: bytes, window_bits: int, max_decoded_bytes: int
+) -> bytes:
+    decompressor = zlib.decompressobj(window_bits)
+    decoded = decompressor.decompress(content, max_decoded_bytes + 1)
+    if len(decoded) > max_decoded_bytes:
+        raise ValueError("decoded response content exceeds source byte limit")
+    if not decompressor.eof:
+        raise zlib.error("incomplete compressed stream")
+    return decoded
+
+
+def _decode_brotli_bounded(content: bytes, max_decoded_bytes: int) -> bytes:
+    if not content:
+        return b""
+    decompressor = brotli.Decompressor()
+    decoded_chunks: list[bytes] = []
+    decoded_size = 0
+    for offset in range(0, len(content), 16 * 1024):
+        chunk = decompressor.process(content[offset : offset + 16 * 1024])
+        decoded_size += len(chunk)
+        if decoded_size > max_decoded_bytes:
+            raise ValueError("decoded response content exceeds source byte limit")
+        decoded_chunks.append(chunk)
+    if not decompressor.is_finished():
+        raise ValueError("incomplete compressed stream")
+    return b"".join(decoded_chunks)
+
+
+def _decode_zstd_bounded(content: bytes, max_decoded_bytes: int) -> bytes:
+    if not content:
+        return b""
+    with zstd.ZstdDecompressor().stream_reader(
+        BytesIO(content), read_across_frames=True
+    ) as compressed:
+        decoded = compressed.read(max_decoded_bytes + 1)
+    return _bounded_identity(decoded, max_decoded_bytes)
 
 
 class ImageProxyAddon:
@@ -320,7 +424,12 @@ class ImageProxyAddon:
             if not self._allowed_content_type(content_type):
                 logger.info("BYPASS host=%s path=%s", host, path)
                 return
-            if original_content is None or self.processor is None or self.cache is None:
+            if (
+                original_content is None
+                or self.processor is None
+                or self.cache is None
+                or self.config is None
+            ):
                 logger.info("BYPASS host=%s path=%s", host, path)
                 return
 
@@ -342,6 +451,7 @@ class ImageProxyAddon:
                     original_content,
                     original_headers.get("Content-Encoding"),
                     content_type,
+                    self.config.processing.max_source_bytes,
                 )
                 await self._run_blocking(
                     self.cache.put,
