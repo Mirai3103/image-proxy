@@ -12,7 +12,7 @@ from mitmproxy.test import tflow
 from PIL import Image
 
 from image_proxy.addon import ImageProxyAddon
-from image_proxy.cache import CacheStore
+from image_proxy.cache import CacheError, CacheStore
 from image_proxy.config import (
     AppConfig,
     CacheConfig,
@@ -59,7 +59,7 @@ def addon_config(tmp_path: Path) -> AppConfig:
 
 
 @pytest.fixture
-def addon(tmp_path: Path):
+async def addon(tmp_path: Path):
     config = addon_config(tmp_path)
     cache = CacheStore(config.cache)
     cache.initialize()
@@ -70,7 +70,7 @@ def addon(tmp_path: Path):
         cache=cache,
     )
     yield instance
-    cache.close()
+    await instance.shutdown()
 
 
 def matching_flow(image_bytes: bytes, content_type: str = "image/jpeg"):
@@ -465,3 +465,288 @@ async def test_cache_failure_restores_original_response(tmp_path, jpeg_bytes, ca
     assert tuple(flow.response.headers.fields) == original_headers
     assert "FALLBACK" in caplog.text
     assert "CacheError" in caplog.text
+    await instance.shutdown()
+
+
+@pytest.fixture
+async def lifecycle_addon(tmp_path: Path):
+    matching = MatchingConfig(("*.cdn.test",), ())
+    processing = ProcessingConfig(
+        "UPSCALED", 90, 90, 10 * 1024**2, 10_000_000, 1
+    )
+    cache_config = CacheConfig(
+        tmp_path / "cache", 3600, 100 * 1024**2, 0.9, 1, 25
+    )
+    config = AppConfig(
+        ProxyConfig("127.0.0.1", 8080), matching, processing, cache_config
+    )
+    cache = CacheStore(cache_config)
+    cache.initialize()
+    instance = ImageProxyAddon(
+        config,
+        matcher=UrlMatcher(matching),
+        processor=WatermarkProcessor(processing),
+        cache=cache,
+    )
+    yield instance
+    await instance.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_returns_response_before_upstream_and_preserves_cors(
+    addon, jpeg_bytes: bytes, caplog
+) -> None:
+    first = matching_flow(jpeg_bytes)
+    first.response.headers["Cache-Control"] = "public, max-age=60"
+    first.response.headers["X-Upstream-Only"] = "not-cacheable"
+    await addon.request(first)
+    await addon.response(first)
+
+    second = tflow.tflow(resp=False)
+    second.request.url = first.request.url
+    with caplog.at_level(logging.INFO):
+        await addon.request(second)
+
+    assert second.response is not None
+    assert second.response.status_code == 200
+    assert second.response.raw_content == first.response.raw_content
+    assert second.response.headers["Content-Type"] == "image/jpeg"
+    assert second.response.headers["Access-Control-Allow-Origin"] == "*"
+    assert second.response.headers["Cache-Control"] == "public, max-age=60"
+    assert "X-Upstream-Only" not in second.response.headers
+    assert "image_proxy.cache_key" not in second.metadata
+    assert "CACHE_HIT" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_lookup_runs_off_event_loop_thread(
+    addon, jpeg_bytes: bytes, monkeypatch
+) -> None:
+    first = matching_flow(jpeg_bytes)
+    await addon.request(first)
+    await addon.response(first)
+    event_loop_thread = threading.get_ident()
+    lookup_threads: list[int] = []
+    original_get = addon.cache.get
+
+    def recording_get(key: str):
+        lookup_threads.append(threading.get_ident())
+        return original_get(key)
+
+    monkeypatch.setattr(addon.cache, "get", recording_get)
+    second = tflow.tflow(resp=False)
+    second.request.url = first.request.url
+
+    await addon.request(second)
+
+    assert second.response is not None
+    assert lookup_threads
+    assert all(thread_id != event_loop_thread for thread_id in lookup_threads)
+
+
+@pytest.mark.asyncio
+async def test_cache_read_failure_fails_open_as_upstream_miss(
+    tmp_path: Path, jpeg_bytes: bytes, caplog
+) -> None:
+    config = addon_config(tmp_path)
+    cache = CacheStore(config.cache)
+    cache.initialize()
+    instance = ImageProxyAddon(
+        config,
+        matcher=UrlMatcher(config.matching),
+        processor=WatermarkProcessor(config.processing),
+        cache=cache,
+    )
+    cache.close()
+    flow = matching_flow(jpeg_bytes)
+
+    with caplog.at_level(logging.INFO):
+        await instance.request(flow)
+
+    assert "image_proxy.cache_key" in flow.metadata
+    assert "FALLBACK" in caplog.text
+    assert "CacheError" in caplog.text
+    assert "CACHE_MISS" in caplog.text
+    await instance.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_identical_concurrent_misses_commit_one_processed_artifact(
+    addon, jpeg_bytes: bytes, monkeypatch
+) -> None:
+    calls = 0
+    original = addon.processor.process
+
+    def counted_process(data: bytes, content_type: str | None):
+        nonlocal calls
+        calls += 1
+        return original(data, content_type)
+
+    monkeypatch.setattr(addon.processor, "process", counted_process)
+    flows = [matching_flow(jpeg_bytes), matching_flow(jpeg_bytes)]
+    for flow in flows:
+        await addon.request(flow)
+
+    await asyncio.gather(*(addon.response(flow) for flow in flows))
+
+    assert calls == 1
+    assert flows[0].response.raw_content == flows[1].response.raw_content
+    assert tuple(flows[0].response.headers.fields) == tuple(
+        flows[1].response.headers.fields
+    )
+
+
+@pytest.mark.asyncio
+async def test_different_cache_keys_process_in_parallel(
+    addon, jpeg_bytes: bytes, monkeypatch
+) -> None:
+    rendezvous = threading.Barrier(2)
+    original = addon.processor.process
+
+    def synchronized_process(data: bytes, content_type: str | None):
+        rendezvous.wait(timeout=2)
+        return original(data, content_type)
+
+    monkeypatch.setattr(addon.processor, "process", synchronized_process)
+    flows = [matching_flow(jpeg_bytes), matching_flow(jpeg_bytes)]
+    flows[0].request.url = "https://img.cdn.test/manga/first.jpg"
+    flows[1].request.url = "https://img.cdn.test/manga/second.jpg"
+    for flow in flows:
+        await addon.request(flow)
+
+    await asyncio.gather(*(addon.response(flow) for flow in flows))
+
+    assert all(flow.response.raw_content != jpeg_bytes for flow in flows)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_runs_startup_and_periodic_cleanup_without_leaking_task(
+    lifecycle_addon, monkeypatch, caplog
+) -> None:
+    calls = 0
+    cleanup_threads: list[int] = []
+    event_loop_thread = threading.get_ident()
+    original_cleanup = lifecycle_addon.cache.cleanup
+
+    def counted_cleanup():
+        nonlocal calls
+        calls += 1
+        cleanup_threads.append(threading.get_ident())
+        return original_cleanup()
+
+    monkeypatch.setattr(lifecycle_addon.cache, "cleanup", counted_cleanup)
+    with caplog.at_level(logging.INFO):
+        await lifecycle_addon.start()
+        await lifecycle_addon.start()
+        task = lifecycle_addon.maintenance_task
+        await asyncio.sleep(1.1)
+        await lifecycle_addon.shutdown()
+        await lifecycle_addon.shutdown()
+
+    assert calls >= 2
+    assert cleanup_threads
+    assert all(thread_id != event_loop_thread for thread_id in cleanup_threads)
+    assert task is not None
+    assert task.cancelled()
+    assert lifecycle_addon.maintenance_task is None
+    assert "EVICTED" not in caplog.text
+    assert "FALLBACK" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_replays_non_utf8_allowlisted_header_bytes(
+    addon, jpeg_bytes: bytes
+) -> None:
+    content_disposition = b'inline; filename="page-\xff.jpg"'
+    first = matching_flow(jpeg_bytes)
+    first.response.headers.fields += (
+        (b"Content-Disposition", content_disposition),
+    )
+    await addon.request(first)
+    await addon.response(first)
+    second = tflow.tflow(resp=False)
+    second.request.url = first.request.url
+
+    await addon.request(second)
+
+    assert second.response is not None
+    assert next(
+        value
+        for name, value in second.response.headers.fields
+        if name.lower() == b"content-disposition"
+    ) == content_disposition
+
+
+@pytest.mark.asyncio
+async def test_repeated_waiter_cancellation_does_not_leak_key_lock(addon) -> None:
+    holder = addon._coordinate_key("same-key")
+    await holder.__aenter__()
+    waiter_context = addon._coordinate_key("same-key")
+    waiter = asyncio.create_task(waiter_context.__aenter__())
+    while addon._key_locks["same-key"][1] != 2:
+        await asyncio.sleep(0)
+
+    async with addon._key_locks_guard:
+        waiter.cancel()
+        await asyncio.sleep(0)
+        waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await holder.__aexit__(None, None, None)
+
+    assert "same-key" not in addon._key_locks
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_caller_cancellation_after_teardown(
+    lifecycle_addon,
+) -> None:
+    maintenance_cancelled = asyncio.Event()
+
+    async def delayed_cancellation() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            maintenance_cancelled.set()
+            await asyncio.Event().wait()
+
+    maintenance_task = asyncio.create_task(delayed_cancellation())
+    lifecycle_addon._maintenance_task = maintenance_task
+    shutdown_task = asyncio.create_task(lifecycle_addon.shutdown())
+    await maintenance_cancelled.wait()
+
+    shutdown_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown_task
+    assert maintenance_task.cancelled()
+    assert lifecycle_addon.maintenance_task is None
+    with pytest.raises(CacheError, match="not initialized"):
+        lifecycle_addon.cache.total_size_bytes()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retries_cache_close_after_transient_failure(
+    lifecycle_addon, monkeypatch
+) -> None:
+    calls = 0
+    original_close = lifecycle_addon.cache.close
+
+    def flaky_close() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise CacheError("simulated close failure")
+        original_close()
+
+    monkeypatch.setattr(lifecycle_addon.cache, "close", flaky_close)
+
+    with pytest.raises(CacheError, match="simulated close failure"):
+        await lifecycle_addon.shutdown()
+    await lifecycle_addon.shutdown()
+
+    assert calls == 2
+    assert lifecycle_addon.maintenance_task is None
+    with pytest.raises(CacheError, match="not initialized"):
+        lifecycle_addon.cache.total_size_bytes()

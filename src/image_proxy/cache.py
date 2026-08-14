@@ -255,7 +255,9 @@ class CacheStore:
     def close(self) -> None:
         """Close the SQLite connection."""
         with self._lock:
-            connection = self._require_connection()
+            connection = self._connection
+            if connection is None:
+                return
             try:
                 connection.close()
             except sqlite3.Error as exc:

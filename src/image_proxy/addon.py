@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 import logging
+from typing import TypeVar
 from urllib.parse import urlsplit
 
 from mitmproxy import http
 from mitmproxy.net import encoding
 
-from image_proxy.cache import CacheStore
+from image_proxy.cache import CacheError, CacheHit, CacheStore, CleanupReport
 from image_proxy.config import AppConfig
 from image_proxy.matcher import UrlMatcher, build_cache_key, is_eligible_request
 from image_proxy.processor import ImageProcessor, ProcessedImage, WatermarkProcessor
@@ -41,6 +45,8 @@ _STALE_REPRESENTATION_HEADERS = (
 )
 
 logger = logging.getLogger(__name__)
+
+_Result = TypeVar("_Result")
 
 
 def _decode_and_process(
@@ -89,6 +95,76 @@ class ImageProxyAddon:
         self.cache = cache or (CacheStore(config.cache) if config else None)
         if config is not None and cache is None:
             self.cache.initialize()
+        workers = config.processing.workers if config is not None else 1
+        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="image-proxy",
+        )
+        self._key_locks_guard = asyncio.Lock()
+        self._key_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+        self._lifecycle_lock = asyncio.Lock()
+        self._maintenance_task: asyncio.Task[None] | None = None
+        self._closed = False
+
+    @property
+    def maintenance_task(self) -> asyncio.Task[None] | None:
+        """Return the active periodic-maintenance task, if any."""
+        return self._maintenance_task
+
+    async def start(self) -> None:
+        """Run startup cleanup and start one periodic-maintenance task."""
+        async with self._lifecycle_lock:
+            if self._closed or self._maintenance_task is not None:
+                return
+            if self.cache is None or self.config is None:
+                return
+
+            try:
+                report = await self._run_blocking(self.cache.cleanup)
+            except Exception as exc:
+                self._log_maintenance_fallback(exc)
+            else:
+                self._log_evicted(report)
+            self._maintenance_task = asyncio.create_task(
+                self._maintenance_loop(), name="image-proxy-cache-maintenance"
+            )
+
+    async def shutdown(self) -> None:
+        """Stop maintenance and release owned cache and worker resources."""
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            caller_cancelled = False
+
+            maintenance_task = self._maintenance_task
+            self._maintenance_task = None
+            if maintenance_task is not None:
+                maintenance_task.cancel()
+                try:
+                    await asyncio.shield(maintenance_task)
+                except asyncio.CancelledError:
+                    if not maintenance_task.done():
+                        caller_cancelled = True
+                        maintenance_task.cancel()
+                        try:
+                            await maintenance_task
+                        except asyncio.CancelledError:
+                            pass
+
+            executor = self._executor
+            self._executor = None
+            if executor is not None:
+                close_future = (
+                    executor.submit(self.cache.close) if self.cache is not None else None
+                )
+                executor.shutdown(wait=True)
+                if close_future is not None:
+                    close_future.result()
+            elif self.cache is not None:
+                self.cache.close()
+            self._closed = True
+            if caller_cancelled:
+                raise asyncio.CancelledError
 
     async def request(self, flow: http.HTTPFlow) -> None:
         """Mark matching eligible requests for response-time processing."""
@@ -110,6 +186,17 @@ class ImageProxyAddon:
                 self.processor.fingerprint,
                 flow.request.headers,
             )
+            key = flow.metadata[_CACHE_KEY_METADATA]
+            try:
+                cached = await self._run_blocking(self.cache.get, key)
+            except CacheError as exc:
+                self._log_fallback(flow, exc)
+            else:
+                if cached is not None:
+                    flow.metadata.pop(_CACHE_KEY_METADATA, None)
+                    flow.response = self._cached_response(cached)
+                    logger.info("CACHE_HIT host=%s path=%s", host, path)
+                    return
             logger.info("CACHE_MISS host=%s path=%s", host, path)
         except Exception as exc:
             flow.metadata.pop(_CACHE_KEY_METADATA, None)
@@ -141,32 +228,36 @@ class ImageProxyAddon:
                 logger.info("BYPASS host=%s path=%s", host, path)
                 return
 
-            cache_headers = {
-                name: original_headers[name]
-                for name in _CACHE_RESPONSE_HEADERS
-                if name in original_headers
-            }
-            processed = await asyncio.to_thread(
-                _decode_and_process,
-                self.processor,
-                original_content,
-                original_headers.get("Content-Encoding"),
-                content_type,
-            )
-            await asyncio.to_thread(
-                self.cache.put,
-                key,
-                flow.request.pretty_url,
-                self.processor.fingerprint,
-                processed.mime_type,
-                cache_headers,
-                processed.data,
-            )
+            async with self._coordinate_key(key):
+                cached = await self._run_blocking(self.cache.get, key)
+                if cached is not None:
+                    self._apply_cached_artifact(response, cached)
+                    logger.info("CACHE_HIT host=%s path=%s", host, path)
+                    return
 
-            for name in _STALE_REPRESENTATION_HEADERS:
-                response.headers.pop(name, None)
-            response.headers["Content-Type"] = processed.mime_type
-            response.raw_content = processed.data
+                cache_headers = {
+                    name: original_headers[name]
+                    for name in _CACHE_RESPONSE_HEADERS
+                    if name in original_headers
+                }
+                processed = await self._run_blocking(
+                    _decode_and_process,
+                    self.processor,
+                    original_content,
+                    original_headers.get("Content-Encoding"),
+                    content_type,
+                )
+                await self._run_blocking(
+                    self.cache.put,
+                    key,
+                    flow.request.pretty_url,
+                    self.processor.fingerprint,
+                    processed.mime_type,
+                    cache_headers,
+                    processed.data,
+                )
+
+                self._apply_processed_artifact(response, processed)
         except Exception as exc:
             if response is not None and original_headers is not None:
                 response.raw_content = original_content
@@ -181,6 +272,123 @@ class ImageProxyAddon:
             processed.format_name,
             len(processed.data),
         )
+
+    async def _run_blocking(
+        self, function: Callable[..., _Result], /, *args: object
+    ) -> _Result:
+        executor = self._executor
+        if executor is None:
+            raise RuntimeError("image proxy worker pool is shut down")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, function, *args)
+
+    @asynccontextmanager
+    async def _coordinate_key(self, key: str) -> AsyncIterator[None]:
+        async with self._key_locks_guard:
+            entry = self._key_locks.get(key)
+            if entry is None:
+                lock = asyncio.Lock()
+                users = 0
+            else:
+                lock, users = entry
+            self._key_locks[key] = (lock, users + 1)
+
+        acquired = False
+        try:
+            await lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                lock.release()
+            release_task = asyncio.create_task(self._release_key_user(key))
+            cancelled_during_release = False
+            while not release_task.done():
+                try:
+                    await asyncio.shield(release_task)
+                except asyncio.CancelledError:
+                    cancelled_during_release = True
+            release_task.result()
+            if cancelled_during_release:
+                raise asyncio.CancelledError
+
+    async def _release_key_user(self, key: str) -> None:
+        async with self._key_locks_guard:
+            current_lock, users = self._key_locks[key]
+            if users == 1:
+                del self._key_locks[key]
+            else:
+                self._key_locks[key] = (current_lock, users - 1)
+
+    async def _maintenance_loop(self) -> None:
+        if self.config is None or self.cache is None:
+            return
+        interval = self.config.cache.cleanup_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                report = await self._run_blocking(self.cache.cleanup)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log_maintenance_fallback(exc)
+            else:
+                self._log_evicted(report)
+
+    @classmethod
+    def _cached_response(cls, cached: CacheHit) -> http.Response:
+        return http.Response.make(200, cached.data, cls._cached_headers(cached))
+
+    @classmethod
+    def _apply_cached_artifact(
+        cls, response: http.Response, cached: CacheHit
+    ) -> None:
+        for name in (*_STALE_REPRESENTATION_HEADERS, *_CACHE_RESPONSE_HEADERS):
+            response.headers.pop(name, None)
+        response.headers.update(cls._cached_headers(cached))
+        response.raw_content = cached.data
+
+    @staticmethod
+    def _apply_processed_artifact(
+        response: http.Response, processed: ProcessedImage
+    ) -> None:
+        for name in _STALE_REPRESENTATION_HEADERS:
+            response.headers.pop(name, None)
+        response.headers["Content-Type"] = processed.mime_type
+        response.raw_content = processed.data
+
+    @staticmethod
+    def _cached_headers(cached: CacheHit) -> dict[str, str]:
+        stored_headers = http.Headers(
+            (
+                name.encode("utf-8", "surrogateescape"),
+                value.encode("utf-8", "surrogateescape"),
+            )
+            for name, value in cached.headers.items()
+        )
+        headers = {
+            name: stored_headers[name]
+            for name in _CACHE_RESPONSE_HEADERS
+            if name in stored_headers
+        }
+        headers["Content-Type"] = cached.mime_type
+        return headers
+
+    @staticmethod
+    def _log_evicted(report: CleanupReport) -> None:
+        if not (report.expired_count or report.lru_count or report.orphan_count):
+            return
+        logger.info(
+            "EVICTED expired=%d lru=%d orphan=%d bytes=%d",
+            report.expired_count,
+            report.lru_count,
+            report.orphan_count,
+            report.bytes_freed,
+        )
+
+    @staticmethod
+    def _log_maintenance_fallback(exc: Exception) -> None:
+        logger.warning("FALLBACK operation=cleanup error=%s", type(exc).__name__)
 
     @staticmethod
     def _allowed_content_type(content_type: str | None) -> bool:
