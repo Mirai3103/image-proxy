@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "image-mitm-proxy"
+version = "0.1.0"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "mitmproxy==11.0.2",
+  "Pillow==12.3.0",
+  "PyYAML==6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.4",
+  "pytest-asyncio==0.24.0",
+]
+
+[project.scripts]
+image-proxy = "image_proxy.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -m 'not smoke'"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["smoke: starts a live mitmdump process"]
+testpaths = ["tests"]
