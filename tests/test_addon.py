@@ -115,6 +115,17 @@ class RecordingCacheStore(CacheStore):
         super().close()
 
 
+class RecordingOptions(SimpleNamespace):
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.updates: list[dict[str, object]] = []
+
+    def update(self, **kwargs: object) -> None:
+        self.updates.append(kwargs)
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+
+
 @pytest.mark.asyncio
 async def test_non_matching_response_passes_through_byte_for_byte(addon) -> None:
     flow = tflow.tflow(resp=True)
@@ -216,7 +227,8 @@ async def test_matching_jpeg_is_processed_and_representation_headers_repaired(
 
     assert flow.response.raw_content != jpeg_bytes
     assert flow.response.headers["Content-Type"] == "image/jpeg"
-    for name in ("Content-Length", "Content-Encoding", "ETag", "Content-MD5", "Digest"):
+    assert flow.response.headers["Content-Length"] == str(len(flow.response.raw_content))
+    for name in ("Content-Encoding", "ETag", "Content-MD5", "Digest"):
         assert name not in flow.response.headers
     assert flow.response.headers["Access-Control-Allow-Origin"] == "*"
     assert flow.response.headers["Cache-Control"] == "public, max-age=60"
@@ -229,6 +241,39 @@ async def test_matching_jpeg_is_processed_and_representation_headers_repaired(
         "Cache-Control": "public, max-age=60",
         "Access-Control-Allow-Origin": "*",
     }
+
+
+@pytest.mark.asyncio
+async def test_processed_response_replaces_stale_content_length(
+    addon, jpeg_bytes: bytes
+) -> None:
+    flow = matching_flow(jpeg_bytes)
+    flow.response.headers["Content-Length"] = str(len(jpeg_bytes))
+
+    await addon.request(flow)
+    await addon.response(flow)
+
+    assert flow.response.headers["Content-Length"] == str(
+        len(flow.response.raw_content)
+    )
+
+
+@pytest.mark.asyncio
+async def test_response_time_cache_replay_sets_content_length(
+    addon, jpeg_bytes: bytes
+) -> None:
+    first = matching_flow(jpeg_bytes)
+    second = matching_flow(jpeg_bytes)
+    await addon.request(first)
+    await addon.request(second)
+
+    await addon.response(first)
+    await addon.response(second)
+
+    assert second.response.raw_content == first.response.raw_content
+    assert second.response.headers["Content-Length"] == str(
+        len(second.response.raw_content)
+    )
 
 
 @pytest.mark.asyncio
@@ -669,6 +714,7 @@ async def test_duplicate_miss_loser_replays_only_cached_headers(
     } == {
         "Access-Control-Allow-Origin",
         "Cache-Control",
+        "Content-Length",
         "Content-Type",
     }
 
@@ -856,13 +902,15 @@ async def test_configure_loads_config_and_initializes_dependencies(
     config_path = tmp_path / "config.yaml"
     config_path.write_text(Path("config.example.yaml").read_text())
     instance = ImageProxyAddon()
+    options = RecordingOptions(image_proxy_config=str(config_path))
     monkeypatch.setattr(
         "image_proxy.addon.ctx",
-        SimpleNamespace(options=SimpleNamespace(image_proxy_config=str(config_path))),
+        SimpleNamespace(options=options),
     )
 
     instance.configure({"image_proxy_config"})
 
+    assert options.updates == [{"connection_strategy": "lazy"}]
     assert instance.config is not None
     assert instance.config.proxy.port == 8080
     assert instance.matcher is not None

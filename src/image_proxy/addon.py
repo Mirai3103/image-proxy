@@ -137,6 +137,7 @@ class ImageProxyAddon:
         except ConfigError as exc:
             raise OptionsError(str(exc)) from exc
 
+        self._prefer_lazy_upstream_connection()
         self._configure_runtime(config)
 
     async def running(self) -> None:
@@ -254,6 +255,12 @@ class ImageProxyAddon:
             self._log_maintenance_fallback(exc)
         else:
             self._log_evicted(report)
+
+    @staticmethod
+    def _prefer_lazy_upstream_connection() -> None:
+        update_options = getattr(ctx.options, "update", None)
+        if update_options is not None:
+            update_options(connection_strategy="lazy")
 
     async def request(self, flow: http.HTTPFlow) -> None:
         """Mark matching eligible requests for response-time processing."""
@@ -434,6 +441,7 @@ class ImageProxyAddon:
     ) -> None:
         response.headers = http.Headers()
         response.headers.update(cls._cached_headers(cached))
+        response.headers["Content-Length"] = str(len(cached.data))
         response.raw_content = cached.data
 
     @staticmethod
@@ -443,6 +451,7 @@ class ImageProxyAddon:
         for name in _STALE_REPRESENTATION_HEADERS:
             response.headers.pop(name, None)
         response.headers["Content-Type"] = processed.mime_type
+        response.headers["Content-Length"] = str(len(processed.data))
         response.raw_content = processed.data
 
     @staticmethod
