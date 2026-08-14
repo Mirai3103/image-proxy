@@ -7,6 +7,7 @@ import gzip
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from io import BytesIO
 import logging
 from pathlib import Path
@@ -52,6 +53,20 @@ _STALE_REPRESENTATION_HEADERS = (
 logger = logging.getLogger(__name__)
 
 _Result = TypeVar("_Result")
+
+
+@dataclass(eq=False)
+class _Runtime:
+    config: AppConfig
+    matcher: UrlMatcher
+    processor: ImageProcessor
+    cache: CacheStore
+    executor: ThreadPoolExecutor | None
+    active_users: int = 0
+    idle: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __post_init__(self) -> None:
+        self.idle.set()
 
 
 def _decode_and_process(
@@ -201,17 +216,33 @@ class ImageProxyAddon:
         self.cache = cache or (CacheStore(config.cache) if config else None)
         if config is not None and cache is None:
             self.cache.initialize()
-        workers = config.processing.workers if config is not None else 1
-        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
-            max_workers=workers,
-            thread_name_prefix="image-proxy",
-        )
+        self._executor: ThreadPoolExecutor | None = None
+        self._runtime: _Runtime | None = None
+        if (
+            config is not None
+            and self.matcher is not None
+            and self.processor is not None
+            and self.cache is not None
+        ):
+            self._executor = ThreadPoolExecutor(
+                max_workers=config.processing.workers,
+                thread_name_prefix="image-proxy",
+            )
+            self._runtime = _Runtime(
+                config,
+                self.matcher,
+                self.processor,
+                self.cache,
+                self._executor,
+            )
         self._key_locks_guard = asyncio.Lock()
         self._key_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_tasks: set[asyncio.Task[None]] = set()
         self._maintenance_task: asyncio.Task[None] | None = None
         self._closed = False
         self._running = False
+        self._shutting_down = False
 
     @property
     def maintenance_task(self) -> asyncio.Task[None] | None:
@@ -246,119 +277,237 @@ class ImageProxyAddon:
 
     async def running(self) -> None:
         """Start background maintenance after mitmproxy starts running."""
+        self._shutting_down = False
         self._running = True
         await self.start()
 
     async def done(self) -> None:
         """Release resources when mitmproxy shuts down."""
-        await self.shutdown()
-        self._running = False
+        try:
+            await self.shutdown()
+        finally:
+            self._running = False
 
     async def start(self) -> None:
         """Run startup cleanup and start one periodic-maintenance task."""
         async with self._lifecycle_lock:
             if self._closed or self._maintenance_task is not None:
                 return
-            if self.cache is None or self.config is None:
+            runtime = self._runtime
+            if runtime is None or runtime.executor is None:
                 return
 
             try:
-                report = await self._run_blocking(self.cache.cleanup)
+                report = await self._run_runtime_blocking(
+                    runtime, runtime.cache.cleanup
+                )
             except Exception as exc:
                 self._log_maintenance_fallback(exc)
             else:
                 self._log_evicted(report)
             self._maintenance_task = asyncio.create_task(
-                self._maintenance_loop(), name="image-proxy-cache-maintenance"
+                self._maintenance_loop(runtime),
+                name="image-proxy-cache-maintenance",
             )
 
     async def shutdown(self) -> None:
         """Stop maintenance and release owned cache and worker resources."""
+        self._shutting_down = True
+        lifecycle_error: BaseException | None = None
+        shutdown_error: BaseException | None = None
+        caller_cancelled = False
+
+        try:
+            await self._wait_for_lifecycle_work()
+        except asyncio.CancelledError:
+            caller_cancelled = True
+        except BaseException as exc:
+            lifecycle_error = exc
+
+        try:
+            await self._shutdown_current_runtime()
+        except asyncio.CancelledError:
+            caller_cancelled = True
+        except BaseException as exc:
+            shutdown_error = exc
+
+        if shutdown_error is not None:
+            raise shutdown_error
+        if lifecycle_error is not None:
+            raise lifecycle_error
+        if caller_cancelled:
+            raise asyncio.CancelledError
+
+    async def _shutdown_current_runtime(self) -> None:
         async with self._lifecycle_lock:
             if self._closed:
                 return
-            caller_cancelled = False
-
-            maintenance_task = self._maintenance_task
-            self._maintenance_task = None
-            if maintenance_task is not None:
-                maintenance_task.cancel()
-                try:
-                    await asyncio.shield(maintenance_task)
-                except asyncio.CancelledError:
-                    if not maintenance_task.done():
-                        caller_cancelled = True
-                        maintenance_task.cancel()
-                        try:
-                            await maintenance_task
-                        except asyncio.CancelledError:
-                            pass
-
-            executor = self._executor
-            self._executor = None
-            if executor is not None:
-                close_future = (
-                    executor.submit(self.cache.close) if self.cache is not None else None
-                )
-                executor.shutdown(wait=True)
-                if close_future is not None:
-                    close_future.result()
-            elif self.cache is not None:
-                self.cache.close()
+            caller_cancelled = await self._cancel_maintenance_task()
+            runtime = self._runtime
+            if runtime is not None:
+                await self._retire_runtime(runtime)
             self._closed = True
             if caller_cancelled:
                 raise asyncio.CancelledError
 
     def _configure_runtime(self, config: AppConfig) -> None:
-        self._stop_maintenance_task()
-        self._close_runtime()
-        self._initialize_runtime(config)
         if self._running:
-            self._run_startup_cleanup_sync()
-            self._maintenance_task = asyncio.create_task(
-                self._maintenance_loop(), name="image-proxy-cache-maintenance"
+            if self._shutting_down:
+                raise OptionsError("image proxy is shutting down")
+            task = asyncio.create_task(
+                self._reconfigure_runtime(config),
+                name="image-proxy-live-reconfigure",
             )
+            self._lifecycle_tasks.add(task)
+            return
 
-    def _stop_maintenance_task(self) -> None:
+        candidate = self._create_runtime(config)
+        try:
+            candidate.cache.initialize()
+        except BaseException:
+            self._close_runtime_sync(candidate)
+            raise
+
+        old_runtime = self._runtime
+        self._install_runtime(candidate)
+        self._shutting_down = False
+        if old_runtime is not None:
+            self._close_runtime_sync(old_runtime)
+
+    async def _reconfigure_runtime(self, config: AppConfig) -> None:
+        async with self._lifecycle_lock:
+            candidate = self._create_runtime(config)
+            installed = False
+            try:
+                await self._run_runtime_blocking(
+                    candidate, candidate.cache.initialize
+                )
+                try:
+                    report = await self._run_runtime_blocking(
+                        candidate, candidate.cache.cleanup
+                    )
+                except Exception as exc:
+                    self._log_maintenance_fallback(exc)
+                else:
+                    self._log_evicted(report)
+
+                old_runtime = self._runtime
+                caller_cancelled = await self._cancel_maintenance_task()
+                self._install_runtime(candidate)
+                installed = True
+                self._maintenance_task = asyncio.create_task(
+                    self._maintenance_loop(candidate),
+                    name="image-proxy-cache-maintenance",
+                )
+                if old_runtime is not None:
+                    await self._retire_runtime(old_runtime)
+                if caller_cancelled:
+                    raise asyncio.CancelledError
+            except BaseException:
+                if not installed:
+                    await self._retire_runtime(candidate)
+                raise
+
+    async def _wait_for_lifecycle_work(self) -> None:
+        first_error: BaseException | None = None
+        caller_cancelled = False
+        while self._lifecycle_tasks:
+            tasks = tuple(self._lifecycle_tasks)
+            self._lifecycle_tasks.difference_update(tasks)
+            waiter = asyncio.gather(*tasks, return_exceptions=True)
+            while not waiter.done():
+                try:
+                    await asyncio.shield(waiter)
+                except asyncio.CancelledError:
+                    caller_cancelled = True
+            results = waiter.result()
+            for result in results:
+                if isinstance(result, BaseException) and first_error is None:
+                    first_error = result
+
+        if first_error is not None:
+            raise first_error
+        if caller_cancelled:
+            raise asyncio.CancelledError
+
+    async def _cancel_maintenance_task(self) -> bool:
         maintenance_task = self._maintenance_task
         self._maintenance_task = None
-        if maintenance_task is not None and not maintenance_task.done():
+        if maintenance_task is None:
+            return False
+
+        caller_cancelled = False
+        if not maintenance_task.done():
             maintenance_task.cancel()
+        while not maintenance_task.done():
+            try:
+                await asyncio.shield(maintenance_task)
+            except asyncio.CancelledError:
+                if maintenance_task.done():
+                    break
+                caller_cancelled = True
+                maintenance_task.cancel()
+        try:
+            maintenance_task.result()
+        except asyncio.CancelledError:
+            pass
+        return caller_cancelled
 
-    def _close_runtime(self) -> None:
-        executor = self._executor
-        self._executor = None
-        if executor is not None:
-            close_future = (
-                executor.submit(self.cache.close) if self.cache is not None else None
-            )
-            executor.shutdown(wait=True)
-            if close_future is not None:
-                close_future.result()
-        elif self.cache is not None:
-            self.cache.close()
-
-    def _initialize_runtime(self, config: AppConfig) -> None:
-        self.config = config
-        self.matcher = UrlMatcher(config.matching)
-        self.processor = WatermarkProcessor(config.processing)
-        self.cache = CacheStore(config.cache)
-        self.cache.initialize()
-        self._executor = ThreadPoolExecutor(
+    def _create_runtime(self, config: AppConfig) -> _Runtime:
+        matcher = UrlMatcher(config.matching)
+        processor = WatermarkProcessor(config.processing)
+        cache = CacheStore(config.cache)
+        executor = ThreadPoolExecutor(
             max_workers=config.processing.workers,
             thread_name_prefix="image-proxy",
         )
+        return _Runtime(config, matcher, processor, cache, executor)
+
+    def _install_runtime(self, runtime: _Runtime) -> None:
+        self._runtime = runtime
+        self.config = runtime.config
+        self.matcher = runtime.matcher
+        self.processor = runtime.processor
+        self.cache = runtime.cache
+        self._executor = runtime.executor
         self._closed = False
 
-    def _run_startup_cleanup_sync(self) -> None:
-        if self.cache is None or self._executor is None:
-            return
-        try:
-            report = self._executor.submit(self.cache.cleanup).result()
-        except Exception as exc:
-            self._log_maintenance_fallback(exc)
+    async def _retire_runtime(self, runtime: _Runtime) -> None:
+        await runtime.idle.wait()
+        executor = runtime.executor
+        if executor is not None:
+            try:
+                await asyncio.to_thread(
+                    self._shutdown_executor_and_close_cache,
+                    executor,
+                    runtime.cache,
+                )
+            finally:
+                runtime.executor = None
+                if self._runtime is runtime:
+                    self._executor = None
         else:
-            self._log_evicted(report)
+            await asyncio.to_thread(runtime.cache.close)
+
+    def _close_runtime_sync(self, runtime: _Runtime) -> None:
+        executor = runtime.executor
+        if executor is not None:
+            try:
+                self._shutdown_executor_and_close_cache(executor, runtime.cache)
+            finally:
+                runtime.executor = None
+                if self._runtime is runtime:
+                    self._executor = None
+        else:
+            runtime.cache.close()
+
+    @staticmethod
+    def _shutdown_executor_and_close_cache(
+        executor: ThreadPoolExecutor, cache: CacheStore
+    ) -> None:
+        close_future = executor.submit(cache.close)
+        executor.shutdown(wait=True)
+        close_future.result()
 
     @staticmethod
     def _prefer_lazy_upstream_connection() -> None:
@@ -369,26 +518,31 @@ class ImageProxyAddon:
     async def request(self, flow: http.HTTPFlow) -> None:
         """Mark matching eligible requests for response-time processing."""
         flow.metadata.pop(_CACHE_KEY_METADATA, None)
+        runtime = self._acquire_runtime()
         try:
             host, path = self._log_location(flow)
             if not is_eligible_request(flow.request.method, flow.request.headers):
                 logger.info("BYPASS host=%s path=%s", host, path)
                 return
-            if self.matcher is None or self.processor is None or self.cache is None:
+            if runtime is None:
                 logger.info("BYPASS host=%s path=%s", host, path)
                 return
-            if not self.matcher.matches(flow.request.host, flow.request.pretty_url):
+            if not runtime.matcher.matches(
+                flow.request.host, flow.request.pretty_url
+            ):
                 logger.info("BYPASS host=%s path=%s", host, path)
                 return
 
             flow.metadata[_CACHE_KEY_METADATA] = build_cache_key(
                 flow.request.pretty_url,
-                self.processor.fingerprint,
+                runtime.processor.fingerprint,
                 flow.request.headers,
             )
             key = flow.metadata[_CACHE_KEY_METADATA]
             try:
-                cached = await self._run_blocking(self.cache.get, key)
+                cached = await self._run_runtime_blocking(
+                    runtime, runtime.cache.get, key
+                )
             except CacheError as exc:
                 self._log_fallback(flow, exc)
             else:
@@ -401,12 +555,15 @@ class ImageProxyAddon:
         except Exception as exc:
             flow.metadata.pop(_CACHE_KEY_METADATA, None)
             self._log_fallback(flow, exc)
+        finally:
+            self._release_runtime(runtime)
 
     async def response(self, flow: http.HTTPFlow) -> None:
         """Transform and cache an eligible successful upstream response."""
         response: http.Response | None = None
         original_content: bytes | None = None
         original_headers: http.Headers | None = None
+        runtime = self._acquire_runtime()
         try:
             key = flow.metadata.get(_CACHE_KEY_METADATA)
             response = flow.response
@@ -424,17 +581,14 @@ class ImageProxyAddon:
             if not self._allowed_content_type(content_type):
                 logger.info("BYPASS host=%s path=%s", host, path)
                 return
-            if (
-                original_content is None
-                or self.processor is None
-                or self.cache is None
-                or self.config is None
-            ):
+            if original_content is None or runtime is None:
                 logger.info("BYPASS host=%s path=%s", host, path)
                 return
 
             async with self._coordinate_key(key):
-                cached = await self._run_blocking(self.cache.get, key)
+                cached = await self._run_runtime_blocking(
+                    runtime, runtime.cache.get, key
+                )
                 if cached is not None:
                     self._apply_cached_artifact(response, cached)
                     logger.info("CACHE_HIT host=%s path=%s", host, path)
@@ -445,19 +599,21 @@ class ImageProxyAddon:
                     for name in _CACHE_RESPONSE_HEADERS
                     if name in original_headers
                 }
-                processed = await self._run_blocking(
+                processed = await self._run_runtime_blocking(
+                    runtime,
                     _decode_and_process,
-                    self.processor,
+                    runtime.processor,
                     original_content,
                     original_headers.get("Content-Encoding"),
                     content_type,
-                    self.config.processing.max_source_bytes,
+                    runtime.config.processing.max_source_bytes,
                 )
-                await self._run_blocking(
-                    self.cache.put,
+                await self._run_runtime_blocking(
+                    runtime,
+                    runtime.cache.put,
                     key,
                     flow.request.pretty_url,
-                    self.processor.fingerprint,
+                    runtime.processor.fingerprint,
                     processed.mime_type,
                     cache_headers,
                     processed.data,
@@ -470,6 +626,8 @@ class ImageProxyAddon:
                 response.headers = original_headers
             self._log_fallback(flow, exc)
             return
+        finally:
+            self._release_runtime(runtime)
 
         logger.info(
             "PROCESSED host=%s path=%s format=%s bytes=%d",
@@ -479,14 +637,35 @@ class ImageProxyAddon:
             len(processed.data),
         )
 
-    async def _run_blocking(
-        self, function: Callable[..., _Result], /, *args: object
+    async def _run_runtime_blocking(
+        self,
+        runtime: _Runtime,
+        function: Callable[..., _Result],
+        /,
+        *args: object,
     ) -> _Result:
-        executor = self._executor
+        executor = runtime.executor
         if executor is None:
             raise RuntimeError("image proxy worker pool is shut down")
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(executor, function, *args)
+
+    def _acquire_runtime(self) -> _Runtime | None:
+        runtime = self._runtime
+        if runtime is None or runtime.executor is None or self._closed:
+            return None
+        runtime.active_users += 1
+        if runtime.active_users == 1:
+            runtime.idle.clear()
+        return runtime
+
+    @staticmethod
+    def _release_runtime(runtime: _Runtime | None) -> None:
+        if runtime is None:
+            return
+        runtime.active_users -= 1
+        if runtime.active_users == 0:
+            runtime.idle.set()
 
     @asynccontextmanager
     async def _coordinate_key(self, key: str) -> AsyncIterator[None]:
@@ -526,14 +705,14 @@ class ImageProxyAddon:
             else:
                 self._key_locks[key] = (current_lock, users - 1)
 
-    async def _maintenance_loop(self) -> None:
-        if self.config is None or self.cache is None:
-            return
-        interval = self.config.cache.cleanup_interval_seconds
+    async def _maintenance_loop(self, runtime: _Runtime) -> None:
+        interval = runtime.config.cache.cleanup_interval_seconds
         while True:
             await asyncio.sleep(interval)
             try:
-                report = await self._run_blocking(self.cache.cleanup)
+                report = await self._run_runtime_blocking(
+                    runtime, runtime.cache.cleanup
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
