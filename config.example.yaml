@@ -5,7 +5,8 @@ proxy:
   port: 8080
 
 matching:
-  # A hostname glob or a full-URL regular expression is sufficient to match.
+  # HTTPS is decrypted only for these hostname globs. Within those hosts, a
+  # request must also match at least one full-URL regex below.
   domains:
     - "*.example-cdn.com"
   url_regex:

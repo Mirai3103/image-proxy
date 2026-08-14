@@ -31,7 +31,8 @@ uv run pytest -m smoke tests/smoke/test_live_proxy.py -q
 
 The smoke test starts temporary loopback HTTP and HTTPS origins, launches
 `mitmdump`, processes a JPEG once, stops the origin, and verifies the second
-request is served from cache.
+request is served from cache. Its HTTPS case also verifies that a host outside
+the domain allowlist retains the origin certificate and response bytes.
 
 ## Configure matching safely
 
@@ -46,11 +47,17 @@ matching:
     - "\\.(jpe?g|webp)(\\?|$)"
 ```
 
-`matching.domains` contains hostname globs only, not full URLs. Prefer the
-narrowest CDN hostnames you can identify. `matching.url_regex` is searched
-against the full URL, including the query string, so avoid broad expressions
-that could intercept unrelated private or authenticated images. A hostname
-glob or a URL regex match is enough to process a request.
+`matching.domains` is a required, non-empty TLS interception allowlist. It
+contains hostname globs only, not full URLs or regular expressions. HTTPS for
+all other hosts is passed through as an untouched tunnel, so mitmproxy does not
+issue certificates for those hosts. Prefer the narrowest CDN hostnames you can
+identify. Restart the proxy after changing this allowlist.
+
+Within an allowed host, `matching.url_regex` is searched against the full URL,
+including the query string. A request must match both its domain group and at
+least one URL regex to be processed. An empty `matching.url_regex` list selects
+every eligible JPEG/WebP on allowed hosts. Avoid broad expressions that could
+intercept unrelated private or authenticated images.
 
 Only static JPEG/JPG and WebP responses are processed. GIF, PNG, SVG, AVIF,
 animated images, video, and non-image content pass through unchanged.
@@ -124,10 +131,10 @@ sudo ufw delete allow from TRUSTED_LAN_CIDR to any port 8080 proto tcp
 9. Android will show a security warning for user-installed CAs. That is
    expected for HTTPS interception. Remove the certificate and manual proxy
    setting when testing is complete.
-10. In Chrome, visit a URL that matches your `matching.domains` or
-    `matching.url_regex`. A matching JPEG/WebP should visibly show the centered
-    red `UPSCALED` watermark. Reloading the same image should produce a
-    `CACHE_HIT` log.
+10. In Chrome, visit a URL on a configured `matching.domains` host that also
+    matches `matching.url_regex`. A matching JPEG/WebP should visibly show the
+    centered red `UPSCALED` watermark. Reloading the same image should produce
+    a `CACHE_HIT` log.
 
 Certificate pinning and user-CA restrictions are outside this version's
 support. Android Chrome can use the installed user CA; many apps and some
