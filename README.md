@@ -90,14 +90,20 @@ matching URLs contain signed parameters.
 ## Firewall
 
 Allow inbound TCP traffic to the configured proxy port only from trusted local
-networks. The exact command depends on your Linux firewall. For UFW:
+networks. The exact command depends on your Linux firewall. For UFW, replace
+`TRUSTED_LAN_CIDR` with your actual trusted LAN subnet (for example,
+`192.168.1.0/24`) before running these commands:
 
 ```bash
-sudo ufw allow 8080/tcp
+sudo ufw allow from TRUSTED_LAN_CIDR to any port 8080 proto tcp
 ```
 
 If you changed `proxy.port`, open that port instead. Close the rule when you no
-longer need LAN devices to connect.
+longer need LAN devices to connect by removing the exact scoped rule:
+
+```bash
+sudo ufw delete allow from TRUSTED_LAN_CIDR to any port 8080 proto tcp
+```
 
 ## Android Chrome setup
 
