@@ -107,6 +107,7 @@ class ImageProxyAddon:
         self._lifecycle_lock = asyncio.Lock()
         self._maintenance_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._running = False
 
     @property
     def maintenance_task(self) -> asyncio.Task[None] | None:
@@ -140,11 +141,13 @@ class ImageProxyAddon:
 
     async def running(self) -> None:
         """Start background maintenance after mitmproxy starts running."""
+        self._running = True
         await self.start()
 
     async def done(self) -> None:
         """Release resources when mitmproxy shuts down."""
         await self.shutdown()
+        self._running = False
 
     async def start(self) -> None:
         """Run startup cleanup and start one periodic-maintenance task."""
@@ -202,13 +205,35 @@ class ImageProxyAddon:
                 raise asyncio.CancelledError
 
     def _configure_runtime(self, config: AppConfig) -> None:
+        self._stop_maintenance_task()
+        self._close_runtime()
+        self._initialize_runtime(config)
+        if self._running:
+            self._run_startup_cleanup_sync()
+            self._maintenance_task = asyncio.create_task(
+                self._maintenance_loop(), name="image-proxy-cache-maintenance"
+            )
+
+    def _stop_maintenance_task(self) -> None:
+        maintenance_task = self._maintenance_task
+        self._maintenance_task = None
+        if maintenance_task is not None and not maintenance_task.done():
+            maintenance_task.cancel()
+
+    def _close_runtime(self) -> None:
         executor = self._executor
         self._executor = None
         if executor is not None:
+            close_future = (
+                executor.submit(self.cache.close) if self.cache is not None else None
+            )
             executor.shutdown(wait=True)
-        if self.cache is not None:
+            if close_future is not None:
+                close_future.result()
+        elif self.cache is not None:
             self.cache.close()
 
+    def _initialize_runtime(self, config: AppConfig) -> None:
         self.config = config
         self.matcher = UrlMatcher(config.matching)
         self.processor = WatermarkProcessor(config.processing)
@@ -219,6 +244,16 @@ class ImageProxyAddon:
             thread_name_prefix="image-proxy",
         )
         self._closed = False
+
+    def _run_startup_cleanup_sync(self) -> None:
+        if self.cache is None or self._executor is None:
+            return
+        try:
+            report = self._executor.submit(self.cache.cleanup).result()
+        except Exception as exc:
+            self._log_maintenance_fallback(exc)
+        else:
+            self._log_evicted(report)
 
     async def request(self, flow: http.HTTPFlow) -> None:
         """Mark matching eligible requests for response-time processing."""

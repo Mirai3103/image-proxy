@@ -2,6 +2,7 @@ import asyncio
 import gzip
 import logging
 import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from mitmproxy.test import tflow
 from PIL import Image
 
 from image_proxy.addon import ImageProxyAddon
-from image_proxy.cache import CacheError, CacheStore
+from image_proxy.cache import CacheError, CacheStore, CleanupReport
 from image_proxy.config import (
     AppConfig,
     CacheConfig,
@@ -94,6 +95,24 @@ class RecordingLoader:
         self, name: str, typespec: type, default: object, help: str
     ) -> None:
         self.options.append((name, typespec, default))
+
+
+class RecordingCacheStore(CacheStore):
+    instances: list["RecordingCacheStore"] = []
+
+    def __init__(self, config: CacheConfig, *, clock=time.time) -> None:
+        super().__init__(config, clock=clock)
+        self.cleanup_count = 0
+        self.close_count = 0
+        RecordingCacheStore.instances.append(self)
+
+    def cleanup(self) -> CleanupReport:
+        self.cleanup_count += 1
+        return super().cleanup()
+
+    def close(self) -> None:
+        self.close_count += 1
+        super().close()
 
 
 @pytest.mark.asyncio
@@ -889,3 +908,74 @@ async def test_done_propagates_unexpected_shutdown_errors(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="shutdown exploded"):
         await instance.done()
+
+
+@pytest.mark.asyncio
+async def test_runtime_configure_restarts_running_lifecycle_on_current_resources(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old_config = AppConfig(
+        ProxyConfig("127.0.0.1", 8080),
+        MatchingConfig(("*.old.test",), ()),
+        ProcessingConfig("OLD", 90, 90, 10 * 1024**2, 10_000_000, 1),
+        CacheConfig(tmp_path / "old-cache", 3600, 100 * 1024**2, 0.9, 9999, 25),
+    )
+    new_config = AppConfig(
+        ProxyConfig("127.0.0.1", 8080),
+        MatchingConfig(("*.new.test",), ()),
+        ProcessingConfig("NEW", 90, 90, 10 * 1024**2, 10_000_000, 1),
+        CacheConfig(tmp_path / "new-cache", 3600, 100 * 1024**2, 0.9, 1, 25),
+    )
+
+    def fake_load_config(path: Path) -> AppConfig:
+        if path.name == "old.yaml":
+            return old_config
+        if path.name == "new.yaml":
+            return new_config
+        raise AssertionError(f"unexpected config path: {path}")
+
+    RecordingCacheStore.instances = []
+    instance = ImageProxyAddon()
+    monkeypatch.setattr("image_proxy.addon.CacheStore", RecordingCacheStore)
+    monkeypatch.setattr("image_proxy.addon.load_config", fake_load_config)
+    options = SimpleNamespace(image_proxy_config=str(tmp_path / "old.yaml"))
+    monkeypatch.setattr("image_proxy.addon.ctx", SimpleNamespace(options=options))
+
+    instance.configure({"image_proxy_config"})
+    first_cache = RecordingCacheStore.instances[-1]
+    first_executor = instance._executor
+    assert instance.maintenance_task is None
+
+    await instance.running()
+    first_task = instance.maintenance_task
+    assert first_task is not None
+    assert first_cache.cleanup_count == 1
+
+    options.image_proxy_config = str(tmp_path / "new.yaml")
+    instance.configure({"image_proxy_config"})
+    await asyncio.sleep(0)
+    second_cache = RecordingCacheStore.instances[-1]
+    second_task = instance.maintenance_task
+
+    try:
+        assert second_cache is not first_cache
+        assert instance.cache is second_cache
+        assert instance._executor is not first_executor
+        assert getattr(first_executor, "_shutdown", False)
+        assert first_cache.close_count == 1
+        assert first_task is not second_task
+        assert first_task.cancelled()
+        assert second_task is not None
+        assert not second_task.done()
+        assert second_cache.cleanup_count == 1
+
+        await asyncio.sleep(1.1)
+
+        assert first_cache.cleanup_count == 1
+        assert second_cache.cleanup_count >= 2
+        assert instance.maintenance_task is second_task
+    finally:
+        await instance.done()
+
+    assert second_cache.close_count == 1
+    assert instance.maintenance_task is None
