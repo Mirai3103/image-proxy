@@ -2,71 +2,86 @@
 
 Native Python/mitmproxy image proxy for a trusted LAN. Android Chrome can use
 the PC as its manual HTTP proxy, trust the generated mitmproxy CA, and receive
-matching JPEG/WebP manga images with an `UPSCALED` watermark. Processed images
-are cached on disk so repeat requests can be served without contacting the
-origin.
+matching JPEG/WebP manga images automatically upscaled using **ComfyUI** (or a
+fallback watermark engine). Processed images are cached on disk so repeat
+requests can be served without contacting the origin.
 
 This proxy listens on `0.0.0.0:8080` by default and has no authentication.
 Run it only on a trusted LAN. Do not expose it to the public internet.
 
+## Features
+
+- **AI Upscaling via ComfyUI**: Sends matching manga/webtoon pages to a local or
+  remote ComfyUI server, applies model upscaling (e.g. `2x-AnimeSharpV3.pth`),
+  and re-encodes to optimized WebP/JPEG for fast mobile delivery.
+- **Selective TLS Interception**: Only intercepts domain hosts configured in the
+  allowlist (`matching.domains`). All other HTTPS traffic passes through as an
+  untouched tunnel.
+- **Fail-Open Safe**: If ComfyUI is busy, offline, or times out, the proxy
+  gracefully falls back to serving the original upstream image.
+- **SQLite + Disk LRU Caching**: Fast disk-backed cache with configurable TTL
+  and LRU size eviction to avoid repeated upscaling.
+
 ## PC setup
 
-From this repository:
+1. Ensure your ComfyUI server is running (e.g., at `http://127.0.0.1:8188`).
+2. Clone this repository and sync dependencies:
 
 ```bash
 uv sync --all-extras
 cp config.example.yaml config.yaml
 uv run image-proxy --config config.yaml
-hostname -I
+hostname -I  # Or 'ip addr' to check your LAN IP
 ```
 
-Use one of the LAN addresses printed by `hostname -I` as the Android proxy
-host. Keep the terminal running while Android Chrome is using the proxy.
+Use one of the LAN addresses (e.g. `192.168.1.3`) as the Android proxy host.
+Keep the terminal running while Android Chrome is using the proxy.
 
-To run the local end-to-end smoke test without Android:
+To run the local automated test suite:
 
 ```bash
+uv run pytest
 uv run pytest -m smoke tests/smoke/test_live_proxy.py -q
 ```
 
-The smoke test starts temporary loopback HTTP and HTTPS origins, launches
-`mitmdump`, processes a JPEG once, stops the origin, and verifies the second
-request is served from cache. Its HTTPS case also verifies that a host outside
-the domain allowlist retains the origin certificate and response bytes.
+## Workflows
 
-## Configure matching safely
+The repository includes pre-configured ComfyUI workflows in the `workflows/` directory:
+
+- `workflows/upscale_workflow.json`: Full workflow graph for drag-and-drop into
+  the ComfyUI Web UI.
+- `workflows/upscale_workflow_api.json`: Node structure used by the proxy API
+  (`LoadImage` -> `UpscaleModelLoader` -> `ImageUpscaleWithModel` -> `SaveImage`).
+
+## Configuration
 
 Edit `config.yaml` before startup:
 
 ```yaml
+proxy:
+  host: 0.0.0.0
+  port: 8080
+
 matching:
   domains:
-    - "*.example-cdn.com"
+    - "zs.wtcdn.xyz"
+    - "img01.manga18fx.com"
   url_regex:
-    - "/manga/"
-    - "\\.(jpe?g|webp)(\\?|$)"
-```
+    - "chapter.*\\.webp$"
+    - "^https://img01\\.manga18fx\\.com/(upload|online)/.*\\.(jpe?g|webp)(\\?|$)"
 
-`matching.domains` is a required, non-empty TLS interception allowlist. It
-contains hostname globs only, not full URLs or regular expressions. HTTPS for
-all other hosts is passed through as an untouched tunnel, so mitmproxy does not
-issue certificates for those hosts. Prefer the narrowest CDN hostnames you can
-identify. Restart the proxy after changing this allowlist.
+processing:
+  engine: "comfyui"           # "comfyui" or "watermark"
+  jpeg_quality: 90
+  webp_quality: 90
+  max_source_mb: 30
+  max_pixels: 80000000
+  workers: 1                  # Concurrent GPU workers
+  comfyui:
+    server_url: "http://127.0.0.1:8188"
+    model_name: "2x-AnimeSharpV3.pth"
+    timeout_seconds: 45
 
-Within an allowed host, `matching.url_regex` is searched against the full URL,
-including the query string. A request must match both its domain group and at
-least one URL regex to be processed. An empty `matching.url_regex` list selects
-every eligible JPEG/WebP on allowed hosts. Avoid broad expressions that could
-intercept unrelated private or authenticated images.
-
-Only static JPEG/JPG and WebP responses are processed. GIF, PNG, SVG, AVIF,
-animated images, video, and non-image content pass through unchanged.
-
-## Cache behavior and maintenance
-
-Defaults store cache data under `./data/cache`:
-
-```yaml
 cache:
   directory: "./data/cache"
   ttl_hours: 168
@@ -76,49 +91,33 @@ cache:
   eviction_batch_size: 25
 ```
 
-TTL is absolute from creation time. A cache hit updates the SQLite
-`last_accessed_at` field for LRU eviction, but it does not extend expiry.
-When the cache exceeds `max_size_gb`, cleanup deletes oldest-accessed entries
-in batches until size reaches `max_size_gb * low_watermark_ratio`.
+### Matching Rules
+`matching.domains` is a required TLS interception allowlist of hostname globs.
+Within an allowed host, `matching.url_regex` is searched against the full URL.
+Only static JPEG/JPG and WebP responses are processed. Non-image content and
+unmatched domains pass through untouched.
 
-To clear the cache, stop the proxy first, then remove the configured cache
-directory:
+## Cache behavior and maintenance
+
+Defaults store cache data under `./data/cache`.
+TTL is absolute from creation time. A cache hit updates the SQLite
+`last_accessed_at` field for LRU eviction. When the cache exceeds `max_size_gb`,
+cleanup deletes oldest-accessed entries in batches until size reaches
+`max_size_gb * low_watermark_ratio`.
+
+To clear the cache, stop the proxy first, then remove the cache directory:
 
 ```bash
 rm -rf data/cache
 ```
 
-Do not delete `data/cache` while the proxy is running.
-
-The local SQLite metadata stores source URLs because the full URL is part of
-cache identity. Treat the cache directory as local private data, especially if
-matching URLs contain signed parameters.
-
-## Firewall
-
-Allow inbound TCP traffic to the configured proxy port only from trusted local
-networks. The exact command depends on your Linux firewall. For UFW, replace
-`TRUSTED_LAN_CIDR` with your actual trusted LAN subnet (for example,
-`192.168.1.0/24`) before running these commands:
-
-```bash
-sudo ufw allow from TRUSTED_LAN_CIDR to any port 8080 proto tcp
-```
-
-If you changed `proxy.port`, open that port instead. Close the rule when you no
-longer need LAN devices to connect by removing the exact scoped rule:
-
-```bash
-sudo ufw delete allow from TRUSTED_LAN_CIDR to any port 8080 proto tcp
-```
-
 ## Android Chrome setup
 
-1. Connect the Android device to the same trusted Wi-Fi/LAN as the PC.
+1. Connect the Android device to the same Wi-Fi/LAN as the PC.
 2. In Android Wi-Fi settings, edit the current network.
-3. Set proxy mode to Manual.
-4. Set proxy host name to the PC LAN address from `hostname -I`.
-5. Set proxy port to `8080`, or your configured `proxy.port`.
+3. Set proxy mode to **Manual**.
+4. Set proxy host name to your PC LAN address (e.g. `192.168.1.3`).
+5. Set proxy port to `8080`.
 6. Save the Wi-Fi settings.
 7. Open Chrome on Android and visit:
 
@@ -126,38 +125,18 @@ sudo ufw delete allow from TRUSTED_LAN_CIDR to any port 8080 proto tcp
    http://mitm.it
    ```
 
-8. Download the Android certificate from the mitmproxy page and install it as a
-   CA certificate when Android prompts.
-9. Android will show a security warning for user-installed CAs. That is
-   expected for HTTPS interception. Remove the certificate and manual proxy
-   setting when testing is complete.
-10. In Chrome, visit a URL on a configured `matching.domains` host that also
-    matches `matching.url_regex`. A matching JPEG/WebP should visibly show the
-    centered red `UPSCALED` watermark. Reloading the same image should produce
-    a `CACHE_HIT` log.
-
-Certificate pinning and user-CA restrictions are outside this version's
-support. Android Chrome can use the installed user CA; many apps and some
-sites may reject user-installed CAs or pin their certificates, so they will
-not be interceptable through this proxy.
+8. Download the Android CA certificate from the mitmproxy page and install it.
+9. Visit a supported manga chapter in Chrome. Images will be automatically
+   upscaled by ComfyUI and cached.
 
 ## Logs
 
 Watch the proxy terminal:
 
-- `CACHE_MISS`: the request matched but no fresh cached artifact was served.
-- `PROCESSED`: an upstream image was transformed and stored.
-- `CACHE_HIT`: a fresh cached artifact was served without the upstream image.
-- `FALLBACK`: proxy-specific processing/cache work failed and the original
-  upstream response was allowed through when possible.
-- `EVICTED`: cleanup removed expired, LRU, or orphaned cache files.
+- `CACHE_MISS`: the request matched and upstream image was fetched.
+- `PROCESSED`: an upstream image was transformed by ComfyUI and cached.
+- `CACHE_HIT`: a fresh cached upscaled artifact was served directly.
+- `FALLBACK`: proxy or ComfyUI processing failed and original upstream response
+  was served safely.
+- `EVICTED`: cleanup removed expired or LRU cache files.
 
-Logs use host and path only. They do not include cookies, authorization
-headers, request bodies, response bodies, or URL query values.
-
-## Replacing the processor later
-
-The current processor is a Pillow watermark implementation for static JPEG and
-WebP. Future Real-ESRGAN, Real-CUGAN, or ComfyUI support should replace the
-`ImageProcessor` implementation while keeping URL matching, mitmproxy
-lifecycle, response handling, and cache behavior unchanged.
