@@ -22,7 +22,13 @@ import zstandard as zstd
 from image_proxy.cache import CacheError, CacheHit, CacheStore, CleanupReport
 from image_proxy.config import AppConfig, ConfigError, load_config
 from image_proxy.matcher import UrlMatcher, build_cache_key, is_eligible_request
-from image_proxy.processor import ImageProcessor, ProcessedImage, WatermarkProcessor
+from image_proxy.processor import (
+    ComfyUIProcessor,
+    ImageProcessor,
+    ProcessedImage,
+    WatermarkProcessor,
+)
+
 
 
 _CACHE_KEY_METADATA = "image_proxy.cache_key"
@@ -174,6 +180,12 @@ def _decode_zstd_bounded(content: bytes, max_decoded_bytes: int) -> bytes:
     return _bounded_identity(decoded, max_decoded_bytes)
 
 
+def _create_processor(config: ProcessingConfig) -> ImageProcessor:
+    if config.engine == "comfyui":
+        return ComfyUIProcessor(config)
+    return WatermarkProcessor(config)
+
+
 class ImageProxyAddon:
     """Select, transform, and persist eligible upstream image responses."""
 
@@ -188,7 +200,7 @@ class ImageProxyAddon:
         self.config = config
         self.matcher = matcher or (UrlMatcher(config.matching) if config else None)
         self.processor = processor or (
-            WatermarkProcessor(config.processing) if config else None
+            _create_processor(config.processing) if config else None
         )
         self.cache = cache or (CacheStore(config.cache) if config else None)
         if config is not None and cache is None:
@@ -466,7 +478,7 @@ class ImageProxyAddon:
 
     def _create_runtime(self, config: AppConfig) -> _Runtime:
         matcher = UrlMatcher(config.matching)
-        processor = WatermarkProcessor(config.processing)
+        processor = _create_processor(config.processing)
         cache = CacheStore(config.cache)
         executor = ThreadPoolExecutor(
             max_workers=config.processing.workers,

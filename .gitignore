@@ -6,3 +6,5 @@ data/
 .mitmproxy/
 dist/
 *.egg-info/
+config.yaml
+

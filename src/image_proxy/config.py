@@ -27,6 +27,13 @@ class MatchingConfig:
 
 
 @dataclass(frozen=True)
+class ComfyUIConfig:
+    server_url: str
+    model_name: str
+    timeout_seconds: float = 45.0
+
+
+@dataclass(frozen=True)
 class ProcessingConfig:
     text: str
     jpeg_quality: int
@@ -34,6 +41,8 @@ class ProcessingConfig:
     max_source_bytes: int
     max_pixels: int
     workers: int
+    engine: str = "watermark"
+    comfyui: ComfyUIConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -87,16 +96,20 @@ def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
 
 
 def _section(
-    root: Mapping[str, Any], name: str, allowed_keys: set[str]
+    root: Mapping[str, Any],
+    name: str,
+    required_keys: set[str],
+    optional_keys: set[str] | None = None,
 ) -> Mapping[str, Any]:
     if name not in root:
         raise ConfigError(f"{name} is required")
     section = _mapping(root[name], name)
+    allowed_keys = required_keys | (optional_keys or set())
     unknown_keys = set(section) - allowed_keys
     if unknown_keys:
         names = ", ".join(sorted(unknown_keys))
         raise ConfigError(f"{name} contains unknown keys: {names}")
-    missing_keys = allowed_keys - set(section)
+    missing_keys = required_keys - set(section)
     if missing_keys:
         field = sorted(missing_keys)[0]
         raise ConfigError(f"{name}.{field} is required")
@@ -147,9 +160,43 @@ def load_config(path: Path) -> AppConfig:
     processing_data = _section(
         root,
         "processing",
-        {"text", "jpeg_quality", "webp_quality", "max_source_mb", "max_pixels", "workers"},
+        {"jpeg_quality", "webp_quality", "max_source_mb", "max_pixels", "workers"},
+        {"engine", "text", "comfyui"},
     )
-    text = _string(processing_data["text"], "processing.text")
+    engine = "watermark"
+    if "engine" in processing_data:
+        engine = _string(processing_data["engine"], "processing.engine").lower()
+        if engine not in {"watermark", "comfyui"}:
+            raise ConfigError("processing.engine must be 'watermark' or 'comfyui'")
+
+    if engine == "watermark":
+        if "text" not in processing_data:
+            raise ConfigError("processing.text is required")
+        text = _string(processing_data["text"], "processing.text")
+        comfyui = None
+    else:
+        text = _string(processing_data.get("text", "UPSCALED"), "processing.text")
+        if "comfyui" not in processing_data:
+            raise ConfigError("processing.comfyui is required")
+        comfyui_data = _section(
+            processing_data,
+            "comfyui",
+            {"server_url", "model_name"},
+            {"timeout_seconds"},
+        )
+        server_url = _string(comfyui_data["server_url"], "comfyui.server_url")
+        model_name = _string(comfyui_data["model_name"], "comfyui.model_name")
+        timeout_seconds = _number(
+            comfyui_data.get("timeout_seconds", 45.0), "comfyui.timeout_seconds"
+        )
+        if timeout_seconds <= 0:
+            raise ConfigError("comfyui.timeout_seconds must be positive")
+        comfyui = ComfyUIConfig(
+            server_url=server_url,
+            model_name=model_name,
+            timeout_seconds=timeout_seconds,
+        )
+
     jpeg_quality = _integer(processing_data["jpeg_quality"], "processing.jpeg_quality")
     webp_quality = _integer(processing_data["webp_quality"], "processing.webp_quality")
     max_source_mb = _integer(processing_data["max_source_mb"], "processing.max_source_mb")
@@ -163,6 +210,7 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("processing.max_pixels must be positive")
     if workers <= 0:
         raise ConfigError("processing.workers must be positive")
+
 
     cache_data = _section(
         root,
@@ -208,6 +256,8 @@ def load_config(path: Path) -> AppConfig:
             max_source_bytes=max_source_mb * 1024**2,
             max_pixels=max_pixels,
             workers=workers,
+            engine=engine,
+            comfyui=comfyui,
         ),
         cache=CacheConfig(
             directory=directory,

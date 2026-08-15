@@ -14,12 +14,20 @@ matching:
     - "\\.(jpe?g|webp)(\\?|$)"
 
 processing:
+  # Engine can be "comfyui" or "watermark" (default: "watermark")
+  engine: "comfyui"
   text: "UPSCALED"
   jpeg_quality: 90
   webp_quality: 90
   max_source_mb: 30
   max_pixels: 80000000
-  workers: 2
+  workers: 1
+  # Required when engine is "comfyui"
+  comfyui:
+    server_url: "http://127.0.0.1:8188"
+    model_name: "2x-AnimeSharpV3.pth"
+    timeout_seconds: 45
+
 
 cache:
   directory: "./data/cache"

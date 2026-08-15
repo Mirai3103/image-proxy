@@ -1532,3 +1532,94 @@ async def test_done_waits_for_live_reconfigure_then_closes_each_runtime_once(
     assert old_cache.close_count == 1
     assert candidate_cache.close_count == 1
     assert instance.maintenance_task is None
+
+
+from image_proxy.config import ComfyUIConfig
+import json
+import urllib.request
+
+
+@pytest.mark.asyncio
+async def test_addon_processes_flow_with_comfyui_engine(tmp_path: Path, monkeypatch) -> None:
+    matching = MatchingConfig(("*.cdn.test",), (r"/manga/",))
+    comfy_config = ComfyUIConfig(
+        server_url="http://127.0.0.1:8188",
+        model_name="2x-AnimeSharpV3.pth",
+        timeout_seconds=45.0,
+    )
+    processing = ProcessingConfig(
+        "UPSCALED", 90, 90, 10 * 1024**2, 10_000_000, 1, engine="comfyui", comfyui=comfy_config
+    )
+    cache_config = CacheConfig(tmp_path / "cache", 3600, 100 * 1024**2, 0.9, 600, 25)
+    config = AppConfig(ProxyConfig("127.0.0.1", 8080), matching, processing, cache_config)
+
+    upscaled_png = encoded_image("PNG")
+    prompt_id = "test-addon-prompt"
+
+    class FakeHTTPResponse:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    def fake_urlopen(req, *args, **kwargs):
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        if "/upload/image" in url:
+            return FakeHTTPResponse(json.dumps({"name": "uploaded.jpg"}).encode("utf-8"))
+        elif "/prompt" in url:
+            return FakeHTTPResponse(json.dumps({"prompt_id": prompt_id}).encode("utf-8"))
+        elif f"/history/{prompt_id}" in url:
+            history = {
+                prompt_id: {
+                    "outputs": {
+                        "4": {
+                            "images": [
+                                {
+                                    "filename": "out_0001.png",
+                                    "subfolder": "",
+                                    "type": "output",
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+            return FakeHTTPResponse(json.dumps(history).encode("utf-8"))
+        elif "/view" in url:
+            return FakeHTTPResponse(upscaled_png)
+        raise ValueError(url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    instance = ImageProxyAddon(config)
+    try:
+        source = encoded_image("JPEG")
+        flow = matching_flow(source)
+
+        await instance.request(flow)
+        assert flow.response is not None  # original response untouched yet
+
+        await instance.response(flow)
+        assert flow.response.status_code == 200
+        assert flow.response.headers["Content-Type"] == "image/jpeg"
+        # Content changed to upscaled image
+        with Image.open(BytesIO(flow.response.raw_content)) as img:
+            assert img.format == "JPEG"
+            assert img.size == (240, 320)
+
+        # Subsequent request should be a CACHE_HIT
+        hit_flow = matching_flow(source)
+        await instance.request(hit_flow)
+        with Image.open(BytesIO(hit_flow.response.raw_content)) as img:
+            assert img.format == "JPEG"
+            assert img.size == (240, 320)
+    finally:
+        await instance.shutdown()
+
