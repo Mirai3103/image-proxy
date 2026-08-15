@@ -250,3 +250,125 @@ def test_comfyui_process_fails_on_server_error(monkeypatch) -> None:
     with pytest.raises(ProcessingError, match="ComfyUI|failed"):
         comfy_processor().process(source, "image/jpeg")
 
+
+def test_comfyui_process_via_websocket_success(monkeypatch) -> None:
+    upscaled_png = image_bytes("PNG", (600, 800))
+    prompt_id = "ws-prompt-123"
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self.closed = True
+
+        def recv(self, timeout=None):
+            # Return executed event with matching prompt_id
+            return json.dumps(
+                {
+                    "type": "executed",
+                    "data": {
+                        "prompt_id": prompt_id,
+                        "node": "4",
+                        "output": {
+                            "images": [
+                                {
+                                    "filename": "ws_out_001.png",
+                                    "subfolder": "",
+                                    "type": "output",
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+
+    class FakeHTTPResponse:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    def fake_urlopen(req, *args, **kwargs):
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        if "/upload/image" in url:
+            return FakeHTTPResponse(json.dumps({"name": "uploaded_ws.webp"}).encode("utf-8"))
+        elif "/prompt" in url:
+            return FakeHTTPResponse(json.dumps({"prompt_id": prompt_id}).encode("utf-8"))
+        elif "/view" in url:
+            return FakeHTTPResponse(upscaled_png)
+        raise ValueError(url)
+
+    monkeypatch.setattr("image_proxy.processor.ws_connect", lambda *args, **kwargs: FakeWebSocket())
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    source = image_bytes("WEBP", (300, 400))
+    result = comfy_processor().process(source, "image/webp")
+
+    assert result.mime_type == "image/webp"
+    assert result.format_name == "WEBP"
+    with Image.open(BytesIO(result.data)) as img:
+        assert img.format == "WEBP"
+        assert img.size == (600, 800)
+
+
+def test_comfyui_process_via_websocket_handles_execution_error(monkeypatch) -> None:
+    prompt_id = "ws-prompt-err"
+
+    class FakeWebSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        def recv(self, timeout=None):
+            return json.dumps(
+                {
+                    "type": "execution_error",
+                    "data": {
+                        "prompt_id": prompt_id,
+                        "exception_message": "CUDA out of memory",
+                    },
+                }
+            )
+
+    class FakeHTTPResponse:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    def fake_urlopen(req, *args, **kwargs):
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        if "/upload/image" in url:
+            return FakeHTTPResponse(json.dumps({"name": "uploaded_ws.webp"}).encode("utf-8"))
+        elif "/prompt" in url:
+            return FakeHTTPResponse(json.dumps({"prompt_id": prompt_id}).encode("utf-8"))
+        raise ValueError(url)
+
+    monkeypatch.setattr("image_proxy.processor.ws_connect", lambda *args, **kwargs: FakeWebSocket())
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    source = image_bytes("WEBP", (300, 400))
+    with pytest.raises(ProcessingError, match="execution error|failed"):
+        comfy_processor().process(source, "image/webp")
+
+

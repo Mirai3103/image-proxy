@@ -17,7 +17,10 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from websockets.sync.client import connect as ws_connect
+
 from image_proxy.config import ComfyUIConfig, ProcessingConfig
+
 
 
 class ProcessingError(RuntimeError):
@@ -276,9 +279,70 @@ class ComfyUIProcessor:
 
     def _execute_comfyui_upscale(self, data: bytes, format_name: str) -> bytes:
         uploaded_name = self._upload_image(data, format_name)
-        prompt_id = self._queue_prompt(uploaded_name)
-        filename, subfolder, img_type = self._wait_for_output(prompt_id)
+        client_id = uuid.uuid4().hex
+        prompt_id: str | None = None
+        try:
+            ws_url = self._ws_url(f"/ws?clientId={client_id}")
+            timeout = self._comfy_config.timeout_seconds
+            with ws_connect(ws_url, open_timeout=min(5.0, timeout), close_timeout=2.0) as ws:
+                prompt_id = self._queue_prompt(uploaded_name, client_id)
+                filename, subfolder, img_type = self._listen_ws_output(
+                    ws, prompt_id, timeout
+                )
+        except Exception:
+            if prompt_id is None:
+                prompt_id = self._queue_prompt(uploaded_name, client_id)
+            filename, subfolder, img_type = self._wait_for_output(prompt_id)
+
         return self._download_output(filename, subfolder, img_type)
+
+    def _ws_url(self, path: str) -> str:
+        url = self._server_url
+        if url.startswith("http://"):
+            base = "ws://" + url[len("http://") :]
+        elif url.startswith("https://"):
+            base = "wss://" + url[len("https://") :]
+        elif url.startswith("ws://") or url.startswith("wss://"):
+            base = url
+        else:
+            base = f"ws://{url}"
+        return f"{base}{path}"
+
+    def _listen_ws_output(
+        self, ws, prompt_id: str, timeout: float
+    ) -> tuple[str, str, str]:
+        start = time.monotonic()
+        while True:
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise ProcessingError("ComfyUI upscale timed out")
+            try:
+                message = ws.recv(timeout=remaining)
+            except TimeoutError:
+                raise ProcessingError("ComfyUI upscale timed out")
+            except Exception as exc:
+                raise ProcessingError("ComfyUI websocket error") from exc
+
+            if isinstance(message, str):
+                try:
+                    event = json.loads(message)
+                except Exception:
+                    continue
+                event_type = event.get("type")
+                event_data = event.get("data", {})
+                if event_type == "execution_error":
+                    raise ProcessingError(f"ComfyUI execution error: {event_data}")
+                elif event_type == "executed":
+                    if event_data.get("prompt_id") == prompt_id:
+                        output = event_data.get("output", {})
+                        images = output.get("images", [])
+                        if images:
+                            img_info = images[0]
+                            return (
+                                img_info["filename"],
+                                img_info.get("subfolder", ""),
+                                img_info.get("type", "output"),
+                            )
 
     def _upload_image(self, data: bytes, format_name: str) -> str:
         boundary = "----ImageProxyBoundary" + uuid.uuid4().hex
@@ -302,7 +366,7 @@ class ComfyUIProcessor:
         except Exception as exc:
             raise ProcessingError("ComfyUI image upload failed") from exc
 
-    def _queue_prompt(self, image_name: str) -> str:
+    def _queue_prompt(self, image_name: str, client_id: str | None = None) -> str:
         workflow = {
             "1": {
                 "inputs": {"image": image_name},
@@ -327,8 +391,8 @@ class ComfyUIProcessor:
                 "class_type": "SaveImage",
             },
         }
-        client_id = str(uuid.uuid4())
-        data = json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8")
+        actual_client_id = client_id or str(uuid.uuid4())
+        data = json.dumps({"prompt": workflow, "client_id": actual_client_id}).encode("utf-8")
         req = urllib.request.Request(
             f"{self._server_url}/prompt",
             data=data,

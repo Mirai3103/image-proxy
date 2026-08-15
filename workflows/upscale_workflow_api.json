@@ -1,0 +1,37 @@
+{
+  "1": {
+    "inputs": {
+      "image": "proxy_537ce5d74e7d.webp"
+    },
+    "class_type": "LoadImage"
+  },
+  "2": {
+    "inputs": {
+      "model_name": "2x-AnimeSharpV3.pth"
+    },
+    "class_type": "UpscaleModelLoader"
+  },
+  "3": {
+    "inputs": {
+      "upscale_model": [
+        "2",
+        0
+      ],
+      "image": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "ImageUpscaleWithModel"
+  },
+  "4": {
+    "inputs": {
+      "filename_prefix": "proxy_upscaled",
+      "images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SaveImage"
+  }
+}
