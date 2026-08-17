@@ -11,17 +11,17 @@ flowchart LR
     ComfyUI["🎨 ComfyUI Server<br/>(AI super-resolution)"]
     CDN["🌐 Manga CDN<br/>(asurascans, truyenvua, etc.)"]
 
-    Client -->|1. GET Image| Proxy
-    Proxy -->|2. Check Cache| Cache
-    Cache -.->|CACHE_HIT: Return Image| Client
-    Proxy -->|3. CACHE_MISS: Fetch Original| CDN
-    CDN -->|4. Raw Image Bytes| Proxy
-    Proxy -->|5. Translate<br/>(detect+OCR+inpaint+render)| Koharu
-    Koharu -->|6. Translated PNG| Proxy
-    Proxy -->|7. Upscale<br/>(ESRGAN/RCAN model)| ComfyUI
-    ComfyUI -->|8. Upscaled PNG| Proxy
-    Proxy -->|9. Re-encode WebP/JPEG| Cache
-    Proxy -->|10. Deliver Final Image| Client
+    Client -->|"1. GET Image"| Proxy
+    Proxy -->|"2. Check Cache"| Cache
+    Cache -.->|"CACHE_HIT: Return Image"| Client
+    Proxy -->|"3. CACHE_MISS: Fetch Original"| CDN
+    CDN -->|"4. Raw Image Bytes"| Proxy
+    Proxy -->|"5. Translate<br/>(detect+OCR+inpaint+render)"| Koharu
+    Koharu -->|"6. Translated PNG"| Proxy
+    Proxy -->|"7. Upscale<br/>(ESRGAN/RCAN model)"| ComfyUI
+    ComfyUI -->|"8. Upscaled PNG"| Proxy
+    Proxy -->|"9. Re-encode WebP/JPEG"| Cache
+    Proxy -->|"10. Deliver Final Image"| Client
 ```
 
 > [!NOTE]
