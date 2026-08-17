@@ -14,15 +14,28 @@ matching:
     - "\\.(jpe?g|webp)(\\?|$)"
 
 processing:
-  # Engine can be "comfyui" or "watermark" (default: "watermark")
-  engine: "comfyui"
+  # Ordered pipeline of image stages. Allowed values: "watermark",
+  # "translate", "upscale". "watermark" cannot combine with others. When both
+  # "translate" and "upscale" are present, "translate" must come first.
+  # Examples:
+  #   pipeline: ["watermark"]
+  #   pipeline: ["upscale"]
+  #   pipeline: ["translate"]
+  #   pipeline: ["translate", "upscale"]
+  pipeline:
+    - "translate"
+    - "upscale"
   text: "UPSCALED"
   jpeg_quality: 90
   webp_quality: 90
   max_source_mb: 30
   max_pixels: 80000000
   workers: 1
-  # Required when engine is "comfyui"
+  # Required when pipeline includes "translate" (koharu-server `/translate`).
+  koharu:
+    server_url: "http://127.0.0.1:8383"
+    timeout_seconds: 120
+  # Required when pipeline includes "upscale" (ComfyUI upscale workflow).
   comfyui:
     server_url: "http://127.0.0.1:8188"
     model_name: "2x-AnimeSharpV3.pth"

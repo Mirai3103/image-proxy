@@ -128,7 +128,7 @@ def comfy_processor(
             max_source_bytes=max_source_bytes,
             max_pixels=max_pixels,
             workers=1,
-            engine="comfyui",
+            pipeline=("upscale",),
             comfyui=ComfyUIConfig(
                 server_url=server_url,
                 model_name=model_name,
@@ -372,3 +372,204 @@ def test_comfyui_process_via_websocket_handles_execution_error(monkeypatch) -> N
         comfy_processor().process(source, "image/webp")
 
 
+
+
+from image_proxy.config import KoharuConfig
+from image_proxy.processor import KoharuProcessor, PipelineProcessor
+
+
+def koharu_processor(
+    server_url: str = "http://127.0.0.1:8383",
+    timeout_seconds: float = 120.0,
+    jpeg_quality: int = 90,
+    webp_quality: int = 88,
+    max_source_bytes: int = 1024**2,
+    max_pixels: int = 1_000_000,
+):
+    return KoharuProcessor(
+        ProcessingConfig(
+            text="PROCESSED",
+            jpeg_quality=jpeg_quality,
+            webp_quality=webp_quality,
+            max_source_bytes=max_source_bytes,
+            max_pixels=max_pixels,
+            workers=1,
+            pipeline=("translate",),
+            koharu=KoharuConfig(
+                server_url=server_url,
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+    )
+
+
+def test_koharu_fingerprint_changes_with_configuration() -> None:
+    base = koharu_processor().fingerprint
+    changed_server = koharu_processor(server_url="http://192.168.1.10:8383").fingerprint
+    changed_timeout = koharu_processor(timeout_seconds=240.0).fingerprint
+
+    assert changed_server != base
+    assert changed_timeout != base
+
+
+def test_koharu_process_success_and_reencodes_to_source_format(monkeypatch) -> None:
+    translated_png = image_bytes("PNG", (400, 600))
+
+    class FakeHTTPResponse:
+        def __init__(self, data: bytes, status: int = 200):
+            self._data = data
+            self.status = status
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    captured = {}
+
+    def fake_urlopen(req, *args, **kwargs):
+        captured["url"] = req.full_url
+        captured["content_type"] = req.get_header("Content-type", "")
+        captured["body"] = req.data
+        return FakeHTTPResponse(translated_png)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    source = image_bytes("WEBP", (400, 600))
+    result = koharu_processor().process(source, "image/webp")
+
+    assert captured["url"] == "http://127.0.0.1:8383/translate"
+    assert "multipart/form-data" in captured["content_type"]
+    assert b'name="image"' in captured["body"]
+    assert result.mime_type == "image/webp"
+    assert result.format_name == "WEBP"
+    with Image.open(BytesIO(result.data)) as img:
+        assert img.format == "WEBP"
+
+
+def test_koharu_process_fails_on_connection_error(monkeypatch) -> None:
+    def fake_urlopen(req, *args, **kwargs):
+        raise urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    source = image_bytes("JPEG", (100, 100))
+    with pytest.raises(ProcessingError, match="koharu|unreachable|failed"):
+        koharu_processor().process(source, "image/jpeg")
+
+
+def test_koharu_process_fails_on_http_error(monkeypatch) -> None:
+    def fake_urlopen(req, *args, **kwargs):
+        raise urllib.error.HTTPError(req.full_url, 500, "Server Error", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    source = image_bytes("JPEG", (100, 100))
+    with pytest.raises(ProcessingError, match="koharu|HTTP 500"):
+        koharu_processor().process(source, "image/jpeg")
+
+
+class _FakeStage:
+    def __init__(self, name: str, output: bytes | None = None, fail: bool = False) -> None:
+        self.name = name
+        self._output = output
+        self._fail = fail
+        self.calls: list[bytes] = []
+        self.fingerprint = f"fake-{name}"
+
+    def transform(self, data: bytes) -> bytes:
+        self.calls.append(data)
+        if self._fail:
+            raise ProcessingError(f"{self.name} failed")
+        return self._output if self._output is not None else data
+
+
+def _pipeline_config(jpeg_quality: int = 90, webp_quality: int = 88):
+    return ProcessingConfig(
+        text="PROCESSED",
+        jpeg_quality=jpeg_quality,
+        webp_quality=webp_quality,
+        max_source_bytes=1024**2,
+        max_pixels=1_000_000,
+        workers=1,
+        pipeline=("translate", "upscale"),
+    )
+
+
+def test_pipeline_runs_stages_in_order_and_encodes_once() -> None:
+    translated = image_bytes("PNG", (800, 1200))
+    upscaled = image_bytes("PNG", (1600, 2400))
+    translate = _FakeStage("translate", output=translated)
+    upscale = _FakeStage("upscale", output=upscaled)
+
+    proc = PipelineProcessor(_pipeline_config(), [translate, upscale])
+
+    source = image_bytes("JPEG", (400, 600))
+    result = proc.process(source, "image/jpeg")
+
+    assert translate.calls == [source]
+    assert upscale.calls == [translated]
+    assert result.mime_type == "image/jpeg"
+    assert result.format_name == "JPEG"
+    with Image.open(BytesIO(result.data)) as img:
+        assert img.size == (1600, 2400)
+
+
+def test_pipeline_skips_non_final_stage_failure_and_continues() -> None:
+    upscaled = image_bytes("PNG", (1600, 2400))
+    translate = _FakeStage("translate", fail=True)
+    upscale = _FakeStage("upscale", output=upscaled)
+
+    proc = PipelineProcessor(_pipeline_config(), [translate, upscale])
+
+    source = image_bytes("JPEG", (400, 600))
+    result = proc.process(source, "image/jpeg")
+
+    assert translate.calls == [source]
+    # upscale ran on the original bytes since translate was skipped
+    assert upscale.calls == [source]
+    assert result.format_name == "JPEG"
+
+
+def test_pipeline_propagates_final_stage_failure() -> None:
+    translate = _FakeStage("translate", output=image_bytes("PNG", (400, 600)))
+    upscale = _FakeStage("upscale", fail=True)
+
+    proc = PipelineProcessor(_pipeline_config(), [translate, upscale])
+
+    source = image_bytes("JPEG", (400, 600))
+    with pytest.raises(ProcessingError, match="upscale failed"):
+        proc.process(source, "image/jpeg")
+
+    assert translate.calls == [source]
+    assert upscale.calls == [translate._output]
+
+
+def test_pipeline_fingerprint_reflects_ordered_stages() -> None:
+    translate_a = _FakeStage("translate")
+    upscale_a = _FakeStage("upscale")
+    fp_a = PipelineProcessor(_pipeline_config(), [translate_a, upscale_a]).fingerprint
+
+    translate_b = _FakeStage("translate")
+    upscale_b = _FakeStage("upscale")
+    fp_b = PipelineProcessor(_pipeline_config(), [translate_b, upscale_b]).fingerprint
+
+    # Same stage fingerprints + order => same pipeline fingerprint
+    assert fp_a == fp_b
+
+    swapped = PipelineProcessor(_pipeline_config(), [upscale_b, translate_b]).fingerprint
+    assert swapped != fp_a
+
+
+def test_pipeline_fingerprint_changes_with_quality() -> None:
+    translate = _FakeStage("translate")
+    upscale = _FakeStage("upscale")
+    base = PipelineProcessor(_pipeline_config(jpeg_quality=90), [translate, upscale]).fingerprint
+    changed = PipelineProcessor(
+        _pipeline_config(jpeg_quality=80), [translate, upscale]
+    ).fingerprint
+    assert changed != base

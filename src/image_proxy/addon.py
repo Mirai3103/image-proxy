@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from io import BytesIO
 import logging
 from pathlib import Path
+import time
 from typing import TypeVar
 from urllib.parse import urlsplit
 import zlib
@@ -25,6 +26,8 @@ from image_proxy.matcher import UrlMatcher, build_cache_key, is_eligible_request
 from image_proxy.processor import (
     ComfyUIProcessor,
     ImageProcessor,
+    KoharuProcessor,
+    PipelineProcessor,
     ProcessedImage,
     WatermarkProcessor,
 )
@@ -181,9 +184,20 @@ def _decode_zstd_bounded(content: bytes, max_decoded_bytes: int) -> bytes:
 
 
 def _create_processor(config: ProcessingConfig) -> ImageProcessor:
-    if config.engine == "comfyui":
-        return ComfyUIProcessor(config)
-    return WatermarkProcessor(config)
+    pipeline = config.pipeline
+    if pipeline == ("watermark",):
+        return WatermarkProcessor(config)
+
+    stages: list[object] = []
+    for stage_name in pipeline:
+        if stage_name == "translate":
+            stages.append(KoharuProcessor(config))
+        elif stage_name == "upscale":
+            stages.append(ComfyUIProcessor(config))
+        # "watermark" combined with ML stages is rejected by config validation.
+    if len(stages) == 1:
+        return stages[0]  # type: ignore[return-value]
+    return PipelineProcessor(config, stages)  # type: ignore[arg-type]
 
 
 class ImageProxyAddon:
@@ -625,6 +639,15 @@ class ImageProxyAddon:
                     for name in _CACHE_RESPONSE_HEADERS
                     if name in original_headers
                 }
+                logger.info(
+                    "PROCESS.start host=%s path=%s bytes=%d encoding=%s content_type=%s",
+                    host,
+                    path,
+                    len(original_content),
+                    original_headers.get("Content-Encoding"),
+                    content_type,
+                )
+                process_start = time.monotonic()
                 processed = await self._run_runtime_blocking(
                     runtime,
                     _decode_and_process,
@@ -633,6 +656,13 @@ class ImageProxyAddon:
                     original_headers.get("Content-Encoding"),
                     content_type,
                     runtime.config.processing.max_source_bytes,
+                )
+                logger.info(
+                    "PROCESS.done host=%s path=%s bytes_out=%d elapsed=%.2fs",
+                    host,
+                    path,
+                    len(processed.data),
+                    time.monotonic() - process_start,
                 )
                 await self._run_runtime_blocking(
                     runtime,

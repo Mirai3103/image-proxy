@@ -1548,7 +1548,7 @@ async def test_addon_processes_flow_with_comfyui_engine(tmp_path: Path, monkeypa
         timeout_seconds=45.0,
     )
     processing = ProcessingConfig(
-        "UPSCALED", 90, 90, 10 * 1024**2, 10_000_000, 1, engine="comfyui", comfyui=comfy_config
+        "UPSCALED", 90, 90, 10 * 1024**2, 10_000_000, 1, pipeline=("upscale",), comfyui=comfy_config
     )
     cache_config = CacheConfig(tmp_path / "cache", 3600, 100 * 1024**2, 0.9, 600, 25)
     config = AppConfig(ProxyConfig("127.0.0.1", 8080), matching, processing, cache_config)
@@ -1623,3 +1623,188 @@ async def test_addon_processes_flow_with_comfyui_engine(tmp_path: Path, monkeypa
     finally:
         await instance.shutdown()
 
+
+
+@pytest.mark.asyncio
+async def test_addon_processes_flow_with_translate_then_upscale_pipeline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from image_proxy.config import KoharuConfig
+
+    matching = MatchingConfig(("*.cdn.test",), (r"/manga/",))
+    koharu_config = KoharuConfig(
+        server_url="http://127.0.0.1:8383",
+        timeout_seconds=120.0,
+    )
+    comfy_config = ComfyUIConfig(
+        server_url="http://127.0.0.1:8188",
+        model_name="2x-AnimeSharpV3.pth",
+        timeout_seconds=45.0,
+    )
+    processing = ProcessingConfig(
+        "PROCESSED", 90, 90, 10 * 1024**2, 10_000_000, 1,
+        pipeline=("translate", "upscale"),
+        koharu=koharu_config,
+        comfyui=comfy_config,
+    )
+    cache_config = CacheConfig(tmp_path / "cache", 3600, 100 * 1024**2, 0.9, 600, 25)
+    config = AppConfig(ProxyConfig("127.0.0.1", 8080), matching, processing, cache_config)
+
+    translated_png = encoded_image("PNG")
+    upscaled_png = encoded_image("PNG")
+    prompt_id = "pipeline-prompt"
+    translate_called = {"count": 0}
+    upload_called = {"count": 0}
+
+    class FakeHTTPResponse:
+        def __init__(self, data: bytes, status: int = 200):
+            self._data = data
+            self.status = status
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    def fake_urlopen(req, *args, **kwargs):
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        if "/translate" in url:
+            translate_called["count"] += 1
+            return FakeHTTPResponse(translated_png)
+        if "/upload/image" in url:
+            upload_called["count"] += 1
+            return FakeHTTPResponse(json.dumps({"name": "uploaded.png"}).encode("utf-8"))
+        if "/prompt" in url:
+            return FakeHTTPResponse(json.dumps({"prompt_id": prompt_id}).encode("utf-8"))
+        if f"/history/{prompt_id}" in url:
+            history = {
+                prompt_id: {
+                    "outputs": {
+                        "4": {
+                            "images": [
+                                {"filename": "out.png", "subfolder": "", "type": "output"}
+                            ]
+                        }
+                    }
+                }
+            }
+            return FakeHTTPResponse(json.dumps(history).encode("utf-8"))
+        if "/view" in url:
+            return FakeHTTPResponse(upscaled_png)
+        raise ValueError(url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    instance = ImageProxyAddon(config)
+    try:
+        source = encoded_image("JPEG")
+        flow = matching_flow(source)
+
+        await instance.request(flow)
+        await instance.response(flow)
+
+        assert flow.response.status_code == 200
+        assert flow.response.headers["Content-Type"] == "image/jpeg"
+        assert translate_called["count"] == 1
+        assert upload_called["count"] == 1
+        with Image.open(BytesIO(flow.response.raw_content)) as img:
+            assert img.format == "JPEG"
+
+        # Second request hits the cache without invoking either engine.
+        hit_flow = matching_flow(source)
+        await instance.request(hit_flow)
+        assert translate_called["count"] == 1
+        assert upload_called["count"] == 1
+    finally:
+        await instance.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_addon_pipeline_skips_translate_when_koharu_unreachable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from image_proxy.config import KoharuConfig
+
+    matching = MatchingConfig(("*.cdn.test",), (r"/manga/",))
+    koharu_config = KoharuConfig(
+        server_url="http://127.0.0.1:8383",
+        timeout_seconds=120.0,
+    )
+    comfy_config = ComfyUIConfig(
+        server_url="http://127.0.0.1:8188",
+        model_name="2x-AnimeSharpV3.pth",
+        timeout_seconds=45.0,
+    )
+    processing = ProcessingConfig(
+        "PROCESSED", 90, 90, 10 * 1024**2, 10_000_000, 1,
+        pipeline=("translate", "upscale"),
+        koharu=koharu_config,
+        comfyui=comfy_config,
+    )
+    cache_config = CacheConfig(tmp_path / "cache", 3600, 100 * 1024**2, 0.9, 600, 25)
+    config = AppConfig(ProxyConfig("127.0.0.1", 8080), matching, processing, cache_config)
+
+    upscaled_png = encoded_image("PNG")
+    prompt_id = "skip-translate-prompt"
+    upload_called = {"count": 0}
+
+    class FakeHTTPResponse:
+        def __init__(self, data: bytes, status: int = 200):
+            self._data = data
+            self.status = status
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    def fake_urlopen(req, *args, **kwargs):
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        if "/translate" in url:
+            raise urllib.error.URLError("Connection refused")
+        if "/upload/image" in url:
+            upload_called["count"] += 1
+            return FakeHTTPResponse(json.dumps({"name": "uploaded.jpg"}).encode("utf-8"))
+        if "/prompt" in url:
+            return FakeHTTPResponse(json.dumps({"prompt_id": prompt_id}).encode("utf-8"))
+        if f"/history/{prompt_id}" in url:
+            history = {
+                prompt_id: {
+                    "outputs": {
+                        "4": {
+                            "images": [
+                                {"filename": "out.png", "subfolder": "", "type": "output"}
+                            ]
+                        }
+                    }
+                }
+            }
+            return FakeHTTPResponse(json.dumps(history).encode("utf-8"))
+        if "/view" in url:
+            return FakeHTTPResponse(upscaled_png)
+        raise ValueError(url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    instance = ImageProxyAddon(config)
+    try:
+        source = encoded_image("JPEG")
+        flow = matching_flow(source)
+
+        await instance.request(flow)
+        await instance.response(flow)
+
+        # Translate failed but upscale ran on the original bytes.
+        assert flow.response.status_code == 200
+        assert upload_called["count"] == 1
+        assert flow.response.headers["Content-Type"] == "image/jpeg"
+    finally:
+        await instance.shutdown()

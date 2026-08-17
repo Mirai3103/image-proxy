@@ -34,6 +34,16 @@ class ComfyUIConfig:
 
 
 @dataclass(frozen=True)
+class KoharuConfig:
+    server_url: str
+    timeout_seconds: float = 120.0
+
+
+# Allowed stage names in the ordered processing pipeline.
+_ALLOWED_STAGES = ("watermark", "translate", "upscale")
+
+
+@dataclass(frozen=True)
 class ProcessingConfig:
     text: str
     jpeg_quality: int
@@ -41,8 +51,9 @@ class ProcessingConfig:
     max_source_bytes: int
     max_pixels: int
     workers: int
-    engine: str = "watermark"
+    pipeline: tuple[str, ...] = ("watermark",)
     comfyui: ComfyUIConfig | None = None
+    koharu: KoharuConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -161,23 +172,59 @@ def load_config(path: Path) -> AppConfig:
         root,
         "processing",
         {"jpeg_quality", "webp_quality", "max_source_mb", "max_pixels", "workers"},
-        {"engine", "text", "comfyui"},
+        {"pipeline", "text", "comfyui", "koharu"},
     )
-    engine = "watermark"
-    if "engine" in processing_data:
-        engine = _string(processing_data["engine"], "processing.engine").lower()
-        if engine not in {"watermark", "comfyui"}:
-            raise ConfigError("processing.engine must be 'watermark' or 'comfyui'")
 
-    if engine == "watermark":
-        if "text" not in processing_data:
-            raise ConfigError("processing.text is required")
-        text = _string(processing_data["text"], "processing.text")
-        comfyui = None
+    if "pipeline" in processing_data:
+        pipeline_raw = processing_data["pipeline"]
+        if isinstance(pipeline_raw, str):
+            pipeline = (pipeline_raw,)
+        elif isinstance(pipeline_raw, list):
+            pipeline = tuple(
+                _string(item, f"processing.pipeline[{index}]")
+                for index, item in enumerate(pipeline_raw)
+            )
+        else:
+            raise ConfigError("processing.pipeline must be a string or list of strings")
     else:
-        text = _string(processing_data.get("text", "UPSCALED"), "processing.text")
+        pipeline = ("watermark",)
+
+    if not pipeline:
+        raise ConfigError("processing.pipeline must contain at least one stage")
+    normalized = tuple(stage.lower() for stage in pipeline)
+    for index, stage in enumerate(normalized):
+        if stage not in _ALLOWED_STAGES:
+            raise ConfigError(
+                f"processing.pipeline[{index}] must be one of: "
+                f"{', '.join(_ALLOWED_STAGES)}"
+            )
+
+    if "watermark" in normalized and len(normalized) > 1:
+        raise ConfigError("processing.pipeline 'watermark' cannot combine with other stages")
+    if (
+        "translate" in normalized
+        and "upscale" in normalized
+        and normalized.index("translate") > normalized.index("upscale")
+    ):
+        raise ConfigError(
+            "processing.pipeline 'translate' must come before 'upscale'"
+        )
+
+    needs_text = "watermark" in normalized
+    needs_koharu = "translate" in normalized
+    needs_comfyui = "upscale" in normalized
+
+    if needs_text:
+        if "text" not in processing_data:
+            raise ConfigError("processing.text is required when pipeline includes 'watermark'")
+        text = _string(processing_data["text"], "processing.text")
+    else:
+        text = _string(processing_data.get("text", "PROCESSED"), "processing.text")
+
+    comfyui = None
+    if needs_comfyui:
         if "comfyui" not in processing_data:
-            raise ConfigError("processing.comfyui is required")
+            raise ConfigError("processing.comfyui is required when pipeline includes 'upscale'")
         comfyui_data = _section(
             processing_data,
             "comfyui",
@@ -195,6 +242,27 @@ def load_config(path: Path) -> AppConfig:
             server_url=server_url,
             model_name=model_name,
             timeout_seconds=timeout_seconds,
+        )
+
+    koharu = None
+    if needs_koharu:
+        if "koharu" not in processing_data:
+            raise ConfigError("processing.koharu is required when pipeline includes 'translate'")
+        koharu_data = _section(
+            processing_data,
+            "koharu",
+            {"server_url"},
+            {"timeout_seconds"},
+        )
+        koharu_server_url = _string(koharu_data["server_url"], "koharu.server_url")
+        koharu_timeout = _number(
+            koharu_data.get("timeout_seconds", 120.0), "koharu.timeout_seconds"
+        )
+        if koharu_timeout <= 0:
+            raise ConfigError("koharu.timeout_seconds must be positive")
+        koharu = KoharuConfig(
+            server_url=koharu_server_url,
+            timeout_seconds=koharu_timeout,
         )
 
     jpeg_quality = _integer(processing_data["jpeg_quality"], "processing.jpeg_quality")
@@ -256,8 +324,9 @@ def load_config(path: Path) -> AppConfig:
             max_source_bytes=max_source_mb * 1024**2,
             max_pixels=max_pixels,
             workers=workers,
-            engine=engine,
+            pipeline=normalized,
             comfyui=comfyui,
+            koharu=koharu,
         ),
         cache=CacheConfig(
             directory=directory,
