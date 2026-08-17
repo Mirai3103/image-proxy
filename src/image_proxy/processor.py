@@ -11,6 +11,7 @@ import warnings
 
 from PIL import Image, ImageDraw, ImageFont
 
+import logging
 import time
 import urllib.error
 import urllib.parse
@@ -19,8 +20,10 @@ import uuid
 
 from websockets.sync.client import connect as ws_connect
 
-from image_proxy.config import ComfyUIConfig, ProcessingConfig
+from image_proxy.config import ComfyUIConfig, KoharuConfig, ProcessingConfig
 
+
+logger = logging.getLogger(__name__)
 
 
 class ProcessingError(RuntimeError):
@@ -46,6 +49,17 @@ class ImageProcessor(Protocol):
 
     def process(self, data: bytes, content_type: str | None) -> ProcessedImage:
         """Process one encoded image."""
+
+
+class _Stage(Protocol):
+    """Internal contract for a single ML transform in an ordered pipeline."""
+
+    @property
+    def fingerprint(self) -> str:
+        ...
+
+    def transform(self, data: bytes) -> bytes:
+        """Run the engine on encoded image bytes and return encoded output bytes."""
 
 
 _ALLOWED_CONTENT_TYPES = {
@@ -76,6 +90,109 @@ def _format_details(format_name: str | None) -> tuple[str, str]:
 
 def _has_alpha(image: Image.Image) -> bool:
     return "A" in image.getbands() or "transparency" in image.info
+
+
+def _quality_for(format_name: str, config: ProcessingConfig) -> int:
+    if format_name == "JPEG":
+        return config.jpeg_quality
+    return config.webp_quality
+
+
+def _inspect_source(
+    data: bytes, content_type: str | None, config: ProcessingConfig
+) -> str:
+    """Validate content type, byte size, and pixel count; return the source format name."""
+    _validate_content_type(content_type)
+    if len(data) > config.max_source_bytes:
+        raise ProcessingError("source byte limit exceeded")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(data)) as image:
+                format_name = image.format
+                _format_details(format_name)
+                if getattr(image, "n_frames", 1) != 1:
+                    raise ProcessingError("animated images are not supported")
+                width, height = image.size
+                if width * height > config.max_pixels:
+                    raise ProcessingError("pixel limit exceeded")
+                image.load()
+                logger.info(
+                    "source.inspect bytes=%d format=%s size=%dx%d pixels=%d",
+                    len(data),
+                    format_name,
+                    width,
+                    height,
+                    width * height,
+                )
+                return format_name or ""
+    except ProcessingError:
+        raise
+    except Exception as exc:
+        raise ProcessingError("image validation failed") from exc
+
+
+def _encode_output(
+    raw_bytes: bytes, source_format_name: str, config: ProcessingConfig
+) -> ProcessedImage:
+    """Re-encode engine output bytes back to the source image's format with proxy quality."""
+    start = time.monotonic()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(raw_bytes)) as image:
+                mime_type, encoder_format = _format_details(source_format_name)
+                target_format = encoder_format
+                target_mime = mime_type
+                if target_format == "WEBP" and (
+                    image.width > 16383 or image.height > 16383
+                ):
+                    target_format = "JPEG"
+                    target_mime = "image/jpeg"
+                if target_format == "JPEG":
+                    converted = image.convert("RGB")
+                elif _has_alpha(image):
+                    converted = image.convert("RGBA")
+                else:
+                    converted = image.convert("RGB")
+                output = BytesIO()
+                converted.save(
+                    output,
+                    format=target_format,
+                    quality=_quality_for(target_format, config),
+                )
+                result = ProcessedImage(output.getvalue(), target_mime, target_format)
+                logger.info(
+                    "output.encode bytes_in=%d bytes_out=%d format=%s size=%dx%d elapsed=%.2fs",
+                    len(raw_bytes),
+                    len(result.data),
+                    target_format,
+                    image.width,
+                    image.height,
+                    time.monotonic() - start,
+                )
+                return result
+    except ProcessingError:
+        raise
+    except Exception as exc:
+        raise ProcessingError("image encoding failed") from exc
+
+
+def _detect_format_name(data: bytes) -> str:
+    """Sniff the format name of encoded image bytes for upload labeling."""
+    try:
+        with Image.open(BytesIO(data)) as image:
+            return (image.format or "PNG").upper()
+    except Exception:
+        return "PNG"
+
+
+def _mime_for_format(format_name: str) -> str:
+    if format_name == "JPEG":
+        return "image/jpeg"
+    if format_name == "WEBP":
+        return "image/webp"
+    return "image/png"
 
 
 class WatermarkProcessor:
@@ -218,67 +335,20 @@ class ComfyUIProcessor:
         return self._fingerprint
 
     def process(self, data: bytes, content_type: str | None) -> ProcessedImage:
-        _validate_content_type(content_type)
-        if len(data) > self._config.max_source_bytes:
-            raise ProcessingError("source byte limit exceeded")
-
+        source_format_name = _inspect_source(data, content_type, self._config)
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(BytesIO(data)) as image:
-                    format_name = image.format
-                    mime_type, encoder_format = _format_details(format_name)
-                    if getattr(image, "n_frames", 1) != 1:
-                        raise ProcessingError("animated images are not supported")
-                    width, height = image.size
-                    if width * height > self._config.max_pixels:
-                        raise ProcessingError("pixel limit exceeded")
-        except ProcessingError:
-            raise
-        except Exception as exc:
-            raise ProcessingError("image validation failed") from exc
-
-        try:
-            upscaled_raw = self._execute_comfyui_upscale(data, encoder_format)
-            with Image.open(BytesIO(upscaled_raw)) as upscaled_image:
-                target_format = encoder_format
-                target_mime = mime_type
-
-                # WebP specification limit: maximum 16,383 x 16,383 pixels
-                if target_format == "WEBP" and (
-                    upscaled_image.width > 16383 or upscaled_image.height > 16383
-                ):
-                    target_format = "JPEG"
-                    target_mime = "image/jpeg"
-
-                if target_format == "JPEG":
-                    converted = upscaled_image.convert("RGB")
-                elif _has_alpha(upscaled_image):
-                    converted = upscaled_image.convert("RGBA")
-                else:
-                    converted = upscaled_image.convert("RGB")
-
-                output = BytesIO()
-                converted.save(
-                    output,
-                    format=target_format,
-                    quality=self._quality_for(target_format),
-                )
-                output_bytes = output.getvalue()
+            upscaled_raw = self.transform(data)
         except ProcessingError:
             raise
         except Exception as exc:
             raise ProcessingError("ComfyUI processing failed") from exc
+        return _encode_output(upscaled_raw, source_format_name, self._config)
 
-        return ProcessedImage(output_bytes, target_mime, target_format)
-
-    def _quality_for(self, format_name: str) -> int:
-        if format_name == "JPEG":
-            return self._config.jpeg_quality
-        return self._config.webp_quality
-
-    def _execute_comfyui_upscale(self, data: bytes, format_name: str) -> bytes:
-        uploaded_name = self._upload_image(data, format_name)
+    def transform(self, data: bytes) -> bytes:
+        """Run the ComfyUI upscale workflow on encoded image bytes; returns PNG bytes."""
+        logger.info("comfyui.upscale.start bytes_in=%d", len(data))
+        start = time.monotonic()
+        uploaded_name = self._upload_image(data)
         client_id = uuid.uuid4().hex
         prompt_id: str | None = None
         try:
@@ -294,7 +364,18 @@ class ComfyUIProcessor:
                 prompt_id = self._queue_prompt(uploaded_name, client_id)
             filename, subfolder, img_type = self._wait_for_output(prompt_id)
 
-        return self._download_output(filename, subfolder, img_type)
+        output = self._download_output(filename, subfolder, img_type)
+        logger.info(
+            "comfyui.upscale.done bytes_out=%d elapsed=%.2fs",
+            len(output),
+            time.monotonic() - start,
+        )
+        return output
+
+    def _quality_for(self, format_name: str) -> int:
+        if format_name == "JPEG":
+            return self._config.jpeg_quality
+        return self._config.webp_quality
 
     def _ws_url(self, path: str) -> str:
         url = self._server_url
@@ -344,10 +425,11 @@ class ComfyUIProcessor:
                                 img_info.get("type", "output"),
                             )
 
-    def _upload_image(self, data: bytes, format_name: str) -> str:
+    def _upload_image(self, data: bytes) -> str:
+        format_name = _detect_format_name(data)
         boundary = "----ImageProxyBoundary" + uuid.uuid4().hex
         filename = f"proxy_{uuid.uuid4().hex[:12]}.{format_name.lower()}"
-        mime = "image/jpeg" if format_name == "JPEG" else "image/webp"
+        mime = _mime_for_format(format_name)
         body = (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
@@ -447,4 +529,185 @@ class ComfyUIProcessor:
                 return resp.read()
         except Exception as exc:
             raise ProcessingError("ComfyUI output download failed") from exc
+
+
+class KoharuProcessor:
+    """Translate (detect+OCR+inpaint+translate+render) via the koharu HTTP service."""
+
+    def __init__(self, config: ProcessingConfig) -> None:
+        self._config = config
+        if config.koharu is None:
+            raise ProcessingError("Koharu configuration is required")
+        self._koharu_config = config.koharu
+        self._server_url = self._koharu_config.server_url.rstrip("/")
+
+        fingerprint_data = {
+            "engine": "koharu",
+            "server_url": self._server_url,
+            "timeout_seconds": self._koharu_config.timeout_seconds,
+            "version": 1,
+        }
+        encoded = json.dumps(
+            fingerprint_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        self._fingerprint = sha256(encoded).hexdigest()
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+    def process(self, data: bytes, content_type: str | None) -> ProcessedImage:
+        source_format_name = _inspect_source(data, content_type, self._config)
+        try:
+            translated_raw = self.transform(data)
+        except ProcessingError:
+            raise
+        except Exception as exc:
+            raise ProcessingError("Koharu processing failed") from exc
+        return _encode_output(translated_raw, source_format_name, self._config)
+
+    def transform(self, data: bytes) -> bytes:
+        """POST the image to koharu `/translate` and return the rendered PNG bytes."""
+        format_name = _detect_format_name(data)
+        boundary = "----ImageProxyBoundary" + uuid.uuid4().hex
+        filename = f"proxy_{uuid.uuid4().hex[:12]}.{format_name.lower()}"
+        mime = _mime_for_format(format_name)
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{self._server_url}/translate",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        timeout = max(1.0, self._koharu_config.timeout_seconds)
+        logger.info(
+            "koharu.translate.start url=%s bytes_in=%d format=%s timeout=%.1fs",
+            self._server_url,
+            len(data),
+            format_name,
+            timeout,
+        )
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", None) or resp.getcode()
+                payload = resp.read()
+                elapsed = time.monotonic() - start
+                logger.info(
+                    "koharu.translate.done status=%s bytes_out=%d elapsed=%.2fs",
+                    status,
+                    len(payload),
+                    elapsed,
+                )
+                if status != 200:
+                    raise ProcessingError(f"koharu translate failed: HTTP {status}")
+                return payload
+        except urllib.error.HTTPError as exc:
+            logger.warning(
+                "koharu.translate.http_error code=%s elapsed=%.2fs",
+                exc.code,
+                time.monotonic() - start,
+            )
+            raise ProcessingError(f"koharu translate failed: HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            logger.warning(
+                "koharu.translate.url_error reason=%s elapsed=%.2fs",
+                exc.reason,
+                time.monotonic() - start,
+            )
+            raise ProcessingError(f"koharu translate unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            logger.warning(
+                "koharu.translate.timeout elapsed=%.2fs", time.monotonic() - start
+            )
+            raise ProcessingError("koharu translate timed out") from exc
+        except ProcessingError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "koharu.translate.error %s elapsed=%.2fs",
+                type(exc).__name__,
+                time.monotonic() - start,
+            )
+            raise ProcessingError("koharu translate failed") from exc
+
+
+class PipelineProcessor:
+    """Run an ordered chain of ML stages with one shared validation and final encode.
+
+    Non-final stage failures are best-effort: the stage is skipped and its input
+    bytes flow into the next stage. The final stage's failure propagates so the
+    addon can fall back to the original upstream bytes.
+    """
+
+    def __init__(self, config: ProcessingConfig, stages: list[_Stage]) -> None:
+        if not stages:
+            raise ProcessingError("pipeline requires at least one stage")
+        self._config = config
+        self._stages = list(stages)
+
+        fingerprint_data = {
+            "pipeline": [stage.fingerprint for stage in self._stages],
+            "jpeg_quality": config.jpeg_quality,
+            "webp_quality": config.webp_quality,
+            "version": 1,
+        }
+        encoded = json.dumps(
+            fingerprint_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        self._fingerprint = sha256(encoded).hexdigest()
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+    def process(self, data: bytes, content_type: str | None) -> ProcessedImage:
+        source_format_name = _inspect_source(data, content_type, self._config)
+        current = data
+        last_index = len(self._stages) - 1
+        for index, stage in enumerate(self._stages):
+            stage_name = type(stage).__name__
+            logger.info(
+                "pipeline.stage.start %d/%d=%s bytes_in=%d",
+                index + 1,
+                len(self._stages),
+                stage_name,
+                len(current),
+            )
+            stage_start = time.monotonic()
+            try:
+                current = stage.transform(current)
+            except ProcessingError as exc:
+                if index == last_index:
+                    logger.warning(
+                        "pipeline.stage.failed %d/%d=%s elapsed=%.2fs error=%s",
+                        index + 1,
+                        len(self._stages),
+                        stage_name,
+                        time.monotonic() - stage_start,
+                        exc,
+                    )
+                    raise
+                logger.warning(
+                    "pipeline.stage.skipped %d/%d=%s elapsed=%.2fs error=%s",
+                    index + 1,
+                    len(self._stages),
+                    stage_name,
+                    time.monotonic() - stage_start,
+                    exc,
+                )
+                continue
+            logger.info(
+                "pipeline.stage.done %d/%d=%s bytes_out=%d elapsed=%.2fs",
+                index + 1,
+                len(self._stages),
+                stage_name,
+                len(current),
+                time.monotonic() - stage_start,
+            )
+        return _encode_output(current, source_format_name, self._config)
 

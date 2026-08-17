@@ -145,13 +145,13 @@ def test_load_config_reads_utf8_config_under_c_locale(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-VALID_COMFYUI = """
+VALID_UPSCALE = """
 proxy: {host: 0.0.0.0, port: 8080}
 matching:
   domains: ["*.cdn.test"]
   url_regex: ["/manga/"]
 processing:
-  engine: comfyui
+  pipeline: ["upscale"]
   jpeg_quality: 90
   webp_quality: 88
   max_source_mb: 30
@@ -171,30 +171,163 @@ cache:
 """
 
 
-def test_load_config_parses_valid_comfyui_configuration(tmp_path: Path) -> None:
+VALID_TRANSLATE = """
+proxy: {host: 0.0.0.0, port: 8080}
+matching:
+  domains: ["*.cdn.test"]
+  url_regex: ["/manga/"]
+processing:
+  pipeline: ["translate"]
+  jpeg_quality: 90
+  webp_quality: 88
+  max_source_mb: 30
+  max_pixels: 80000000
+  workers: 1
+  koharu:
+    server_url: "http://127.0.0.1:8383"
+    timeout_seconds: 120
+cache:
+  directory: ./data/cache
+  ttl_hours: 168
+  max_size_gb: 10
+  low_watermark_ratio: 0.90
+  cleanup_interval_minutes: 10
+  eviction_batch_size: 25
+"""
+
+
+VALID_PIPELINE = """
+proxy: {host: 0.0.0.0, port: 8080}
+matching:
+  domains: ["*.cdn.test"]
+  url_regex: ["/manga/"]
+processing:
+  pipeline: ["translate", "upscale"]
+  jpeg_quality: 90
+  webp_quality: 88
+  max_source_mb: 30
+  max_pixels: 80000000
+  workers: 1
+  koharu:
+    server_url: "http://127.0.0.1:8383"
+    timeout_seconds: 120
+  comfyui:
+    server_url: "http://127.0.0.1:8188"
+    model_name: "2x-AnimeSharpV3.pth"
+    timeout_seconds: 45
+cache:
+  directory: ./data/cache
+  ttl_hours: 168
+  max_size_gb: 10
+  low_watermark_ratio: 0.90
+  cleanup_interval_minutes: 10
+  eviction_batch_size: 25
+"""
+
+
+def test_load_config_parses_valid_upscale_configuration(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(VALID_COMFYUI)
+    path.write_text(VALID_UPSCALE)
 
     config = load_config(path)
 
-    assert config.processing.engine == "comfyui"
+    assert config.processing.pipeline == ("upscale",)
     assert config.processing.comfyui is not None
     assert config.processing.comfyui.server_url == "http://127.0.0.1:8188"
     assert config.processing.comfyui.model_name == "2x-AnimeSharpV3.pth"
     assert config.processing.comfyui.timeout_seconds == 45.0
+    assert config.processing.koharu is None
 
 
-def test_load_config_rejects_invalid_engine(tmp_path: Path) -> None:
+def test_load_config_parses_valid_translate_configuration(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(VALID.replace("text: UPSCALED", "engine: invalid\n  text: UPSCALED"))
+    path.write_text(VALID_TRANSLATE)
 
-    with pytest.raises(ConfigError, match="processing.engine"):
+    config = load_config(path)
+
+    assert config.processing.pipeline == ("translate",)
+    assert config.processing.koharu is not None
+    assert config.processing.koharu.server_url == "http://127.0.0.1:8383"
+    assert config.processing.koharu.timeout_seconds == 120.0
+    assert config.processing.comfyui is None
+
+
+def test_load_config_parses_valid_translate_then_upscale_pipeline(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID_PIPELINE)
+
+    config = load_config(path)
+
+    assert config.processing.pipeline == ("translate", "upscale")
+    assert config.processing.koharu is not None
+    assert config.processing.comfyui is not None
+
+
+def test_load_config_accepts_pipeline_as_single_string(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID_UPSCALE.replace('pipeline: ["upscale"]', 'pipeline: "upscale"'))
+
+    config = load_config(path)
+
+    assert config.processing.pipeline == ("upscale",)
+
+
+def test_load_config_defaults_to_watermark_when_pipeline_missing(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID)
+
+    config = load_config(path)
+
+    assert config.processing.pipeline == ("watermark",)
+
+
+def test_load_config_rejects_invalid_stage(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID.replace("text: UPSCALED", 'pipeline: ["bogus"]\n  text: UPSCALED'))
+
+    with pytest.raises(ConfigError, match="processing.pipeline"):
+        load_config(path)
+
+
+def test_load_config_rejects_watermark_combined_with_other_stages(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        VALID.replace("text: UPSCALED", 'pipeline: ["watermark", "upscale"]\n  text: UPSCALED')
+    )
+
+    with pytest.raises(ConfigError, match="watermark"):
+        load_config(path)
+
+
+def test_load_config_rejects_upscale_before_translate(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID_PIPELINE.replace('["translate", "upscale"]', '["upscale", "translate"]'))
+
+    with pytest.raises(ConfigError, match="translate.*before.*upscale"):
+        load_config(path)
+
+
+def test_load_config_rejects_missing_koharu_section(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        VALID_PIPELINE.replace(
+            '  koharu:\n    server_url: "http://127.0.0.1:8383"\n    timeout_seconds: 120\n',
+            "",
+        )
+    )
+
+    with pytest.raises(ConfigError, match="processing.koharu is required"):
         load_config(path)
 
 
 def test_load_config_rejects_missing_comfyui_section(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(VALID.replace("text: UPSCALED", "engine: comfyui"))
+    path.write_text(
+        VALID_PIPELINE.replace(
+            '  comfyui:\n    server_url: "http://127.0.0.1:8188"\n    model_name: "2x-AnimeSharpV3.pth"\n    timeout_seconds: 45\n',
+            "",
+        )
+    )
 
     with pytest.raises(ConfigError, match="processing.comfyui is required"):
         load_config(path)
@@ -213,7 +346,25 @@ def test_load_config_rejects_invalid_comfyui_values(
     tmp_path: Path, old: str, new: str, message: str
 ) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(VALID_COMFYUI.replace(old, new))
+    path.write_text(VALID_UPSCALE.replace(old, new))
+
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        ('server_url: "http://127.0.0.1:8383"', 'server_url: ""', "koharu.server_url"),
+        ("timeout_seconds: 120", "timeout_seconds: 0", "koharu.timeout_seconds"),
+        ("timeout_seconds: 120", "timeout_seconds: -5", "koharu.timeout_seconds"),
+    ],
+)
+def test_load_config_rejects_invalid_koharu_values(
+    tmp_path: Path, old: str, new: str, message: str
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID_TRANSLATE.replace(old, new))
 
     with pytest.raises(ConfigError, match=message):
         load_config(path)
